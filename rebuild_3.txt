@@ -1,0 +1,277 @@
+
+            
+            # =========================================================================
+            # CONTINENTAL RETRIEVAL SYSTEM (CLIP)
+            # =========================================================================
+            try:
+                print(f"[FOOD UPLOAD] Calling CONTINENTAL retrieval pipeline...")
+                
+                # Run retrieval (Top-5)
+                # Note: main_inference handles PIL conversion and logic internally
+                retrieval_result = continental_system.main_inference(tmp_path, k=5)
+                
+                # Check status
+                if retrieval_result["status"] != "ok":
+                    print(f"[FOOD UPLOAD] Retrieval Unsure: {retrieval_result.get('message')}")
+                    return {
+                        "status": "success",
+                        "food_name": "Unknown Food",
+                        "confidence": 0.0,
+                        "resolution_type": "unknown",
+                        "safety_verdict": "unknown",
+                        "nutrition": {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "sugar_g": 0, "fiber_g": 0, "sodium_mg": 0},
+                        "meta": {"suggestions": []}
+                    }
+                
+                # Start with best match
+                top_match = retrieval_result["top_k_predictions"][0]
+                final_food_name = top_match["dish"]
+                final_confidence = top_match["score"]
+                
+                print(f"[FOOD UPLOAD] ✓ Top Match: {final_food_name} ({final_confidence:.3f})")
+                
+                # Get nutrition if available
+                from services.nutrition_registry import get_nutrition_registry
+                nutrition_registry = get_nutrition_registry()
+                
+                nutrition = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "sugar_g": 0, "fiber_g": 0, "sodium_mg": 0}
+                if nutrition_registry:
+                    lookup = nutrition_registry.get_by_name(final_food_name)
+                    if lookup:
+                        nutrition = lookup
+                        print(f"[FOOD UPLOAD] ✓ Nutrition found for {final_food_name}")
+
+                # Build final response
+                return {
+                    "status": "success",
+                    "food_name": final_food_name,
+                    "confidence": final_confidence,
+                    "resolution_type": "retrieval",
+                    "safety_verdict": "safe", 
+                    "nutrition": {
+                        "calories": float(nutrition.get("calories", 0)),
+                        "protein_g": float(nutrition.get("protein_g", 0)),
+                        "carbs_g": float(nutrition.get("carbs_g", 0)),
+                        "fat_g": float(nutrition.get("fat_g", 0)),
+                        "sugar_g": float(nutrition.get("sugar_g", 0)),
+                        "fiber_g": float(nutrition.get("fiber_g", 0)),
+                        "sodium_mg": float(nutrition.get("sodium_mg", 0)),
+                    },
+                    "meta": {
+                        "top_k": retrieval_result["top_k_predictions"]
+                    }
+                }
+                    
+            except Exception as e:
+                print(f"[FOOD UPLOAD] ERROR: Retrieval failed: {e}")
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(status_code=500, detail=f"Recognition failed: {str(e)}")
+            
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+                
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+
+# =============================================================================
+# ROUTES: MEALS API
+# =============================================================================
+
+@app.get("/api/meals/today")
+async def get_today_meals(user: dict = None):
+    """
+    Get all meals logged today by the current user.
+    TEMP: Auth optional for testing.
+    """
+    # For testing: use demo user if no auth
+    if not user:
+        user = {"sub": "demo_user_123"}
+    
+    user_id = user["sub"]
+    today = datetime.now().date()
+    
+    if user_id not in user_meal_logs:
+        return {"meals": [], "message": "No meals logged yet"}
+    
+    # Filter to today's meals only
+    today_meals = []
+    for meal in user_meal_logs[user_id]:
+        try:
+            meal_date = datetime.fromisoformat(meal["timestamp"]).date()
+            if meal_date == today:
+                today_meals.append(meal)
+        except:
+            continue
+    
+    return {
+        "meals": today_meals,
+        "count": len(today_meals),
+        "date": today.isoformat(),
+    }
+
+
+@app.delete("/api/meals/clear")
+async def clear_meals(user: dict = None):
+    """Clear all meals for the current user (for testing)."""
+    if not user:
+        user = {"sub": "demo_user_123"}
+    user_id = user["sub"]
+    if user_id in user_meal_logs:
+        user_meal_logs[user_id] = []
+    return {"message": "Meals cleared"}
+
+
+@app.get("/api/food/current")
+async def get_current_food(user: dict = None):
+    """
+    Get the most recently scanned food for immediate AI coach context.
+    
+    This is THE PRIMARY endpoint the AI coach should use.
+    Returns the food that was just analyzed, with full nutrition data.
+    """
+    if not user:
+        user = {"sub": "demo_user_123"}
+    
+    user_id = user["sub"]
+    
+    if user_id not in current_food_context:
+        return {
+            "has_food": False,
+            "message": "No food scanned yet. Upload a food image first."
+        }
+    
+    food_data = current_food_context[user_id]
+    
+    return {
+        "has_food": True,
+        "food": {
+            "name": food_data["food_name"],
+            "calories": food_data["nutrition"]["calories"],
+            "protein_g": food_data["nutrition"]["protein_g"],
+            "carbs_g": food_data["nutrition"]["carbs_g"],
+            "fat_g": food_data["nutrition"]["fat_g"],
+            "sugar_g": food_data["nutrition"]["sugar_g"],
+            "fiber_g": food_data["nutrition"]["fiber_g"],
+            "sodium_mg": food_data["nutrition"]["sodium_mg"],
+        },
+        "source": food_data["source"],
+        "confidence": food_data["confidence"],
+        "scanned_at": food_data["timestamp"]
+    }
+
+# =============================================================================
+# ROUTES: RECIPE GENERATION
+# =============================================================================
+
+class RecipeRequest(BaseModel):
+    ingredients: Optional[List[str]] = []
+
+
+@app.post("/api/recipe/generate")
+async def generate_recipe(
+    request: RecipeRequest,
+    user: dict = Depends(get_optional_user),
+):
+    """
+    Generate a recipe from ingredients.
+    
+    Flow:
+    1. Parse ingredients
+    2. Check medical constraints
+    3. Generate recipe
+    4. Validate against rules
+    """
+    # Demo mode fallback
+    if not user:
+        user = {"sub": "demo_user_123"}
+    
+    if not request.ingredients:
+        raise HTTPException(status_code=400, detail="No ingredients provided")
+    
+    # Get nutrition for each ingredient
+    total_nutrition = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0}
+    
+    for ingredient in request.ingredients:
+        # Check against food database
+        ingredient_lower = ingredient.lower()
+        for food, data in FOOD_DATABASE.items():
+            if food in ingredient_lower:
+                total_nutrition["calories"] += data.get("calories", 0)
+                total_nutrition["protein_g"] += data.get("protein_g", 0)
+                total_nutrition["carbs_g"] += data.get("carbs_g", 0)
+                total_nutrition["fat_g"] += data.get("fat_g", 0)
+                break
+    
+    # Generate simple recipe
+    recipe_name = f"Healthy {request.ingredients[0].split()[-1].title()} Dish"
+    
+    instructions = [
+        f"Prepare all ingredients: {', '.join(request.ingredients[:3])}",
+        "Heat a pan with a little olive oil over medium heat",
+        "Add proteins first and cook until done (5-7 minutes)",
+        "Add vegetables and stir-fry for 3-4 minutes",
+        "Season with salt, pepper, and your preferred herbs",
+        "Serve hot and enjoy your healthy meal!"
+    ]
+    
+    return {
+        "status": "success",
+        "recipe_name": recipe_name,
+        "ingredients": request.ingredients,
+        "instructions": instructions,
+        "nutrition": total_nutrition,
+        "serves": 2,
+    }
+
+
+# (Duplicate /api/meal/fix removed - the correct endpoint is defined above in the ROUTES: FIX MEAL section)
+
+# =============================================================================
+# ROUTES: ANALYTICS
+# =============================================================================
+
+@app.get("/api/analytics/summary")
+async def get_analytics_summary(user: dict = Depends(get_current_user)):
+    """
+    Get analytics summary for user.
+    """
+    # Demo analytics data
+    return {
+        "health_score": 72,
+        "health_grade": "B",
+        "weekly_calories": {
+            "target": 14000,
+            "actual": 12500,
+            "status": "good"
+        },
+        "macro_balance": {
+            "protein": {"target": 25, "actual": 22},
+            "carbs": {"target": 50, "actual": 55},
+            "fat": {"target": 25, "actual": 23}
+        },
+        "streaks": {
+            "logging": 5,
+            "safe_meals": 12
+        },
+        "trends": {
+            "calories": "decreasing",
+            "protein": "stable",
+            "sugar": "decreasing"
+        }
+    }
+
+
+# =============================================================================
+# RUN
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

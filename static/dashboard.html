@@ -599,6 +599,22 @@
                 transform: rotate(360deg);
             }
         }
+
+        .logout-btn {
+            width: 40px;
+            height: 40px;
+            border: none;
+            background: #fee2e2;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 18px;
+            transition: all 0.2s ease;
+        }
+
+        .logout-btn:hover {
+            background: #fecaca;
+            transform: scale(1.05);
+        }
     </style>
 </head>
 
@@ -616,6 +632,7 @@
                 <div class="user-avatar" id="userAvatar">U</div>
                 <span class="user-name" id="userName">User</span>
             </div>
+            <button class="logout-btn" id="logoutBtn" onclick="handleLogout()" title="Logout">🚪</button>
         </div>
     </header>
 
@@ -832,6 +849,27 @@
         const userName = localStorage.getItem('user_name') || 'User';
         document.getElementById('userName').textContent = userName;
         document.getElementById('userAvatar').textContent = userName.charAt(0).toUpperCase();
+
+        // Logout function
+        async function handleLogout() {
+            try {
+                // Call logout API
+                await fetch('/auth/logout', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+            } catch (err) {
+                console.log('Logout API call failed, proceeding with local logout');
+            }
+
+            // Clear local storage
+            localStorage.removeItem('token');
+            localStorage.removeItem('user_id');
+            localStorage.removeItem('user_name');
+
+            // Redirect to login
+            window.location.href = 'login.html';
+        }
 
         // Load profile data from API
         async function loadProfile() {

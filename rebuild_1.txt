@@ -1,0 +1,800 @@
+"""
+FastAPI Application for AI Nutrition
+
+Provides REST API endpoints for:
+- Authentication (login, register)
+- Virtual Coach (chat)
+- Analytics (health score, trends, insights)
+- Food logging
+- Medical report upload with OCR
+"""
+
+# Load environment variables FIRST (before other imports that may need them)
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+import os
+import sys
+import uuid
+import tempfile
+
+# Add src to path
+sys.path.insert(0, os.path.dirname(__file__))
+
+# =============================================================================
+# MANDATORY DEPENDENCY CHECK - HARD FAIL IF MISSING
+# =============================================================================
+# The stable food recognition pipeline REQUIRES SigLIP via HuggingFace Transformers.
+# If SigLIP is not available, the app MUST NOT start.
+# This prevents silent fallback to broken classification.
+
+try:
+    import transformers
+    print(f"[STARTUP] HuggingFace Transformers v{transformers.__version__} available - stable food recognition enabled")
+except ImportError as e:
+    print("[STARTUP] CRITICAL ERROR: HuggingFace Transformers is NOT installed!")
+    print("[STARTUP] The stable food recognition pipeline CANNOT run without SigLIP.")
+    print("[STARTUP] To fix: pip install transformers torch")
+    raise RuntimeError(
+        "HuggingFace Transformers is not installed. Stable food recognition pipeline cannot run. "
+        "Install with: pip install transformers torch"
+    ) from e
+
+from models.food import Food, NutritionInfo, FoodCategory
+from models.user import UserProfile, HealthCondition, DailyTargets, DailyIntake
+from rules.engine import RuleEngine
+from coach.virtual_coach import VirtualCoach
+from analytics.analytics_service import AnalyticsService, MealLogStore
+from feedback.feedback_service import FeedbackService, FeedbackStore
+from auth.auth_service import auth_service
+from auth.database import MedicalProfileRepository, UploadRepository
+from services.llm_service import get_mistral_service, get_llm_service
+from services.rag_service import get_rag_service
+from services.llm_service import get_mistral_service, get_llm_service
+from services.rag_service import get_rag_service
+# Legacy pipeline removed
+from services.continental_retrieval import get_continental_retrieval_system
+from services.nutrition_registry import get_nutrition_registry
+
+# =============================================================================
+# APP SETUP
+# =============================================================================
+
+app = FastAPI(
+    title="AI Nutrition API",
+    description="Context-aware nutrition guidance with medical safety",
+    version="3.0.0",
+)
+
+# CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files
+static_path = os.path.join(os.path.dirname(__file__), "..", "static")
+app.mount("/static", StaticFiles(directory=static_path), name="static")
+
+@app.on_event("startup")
+async def startup_event():
+    """Foundational startup: database init and eager model loading."""
+    print("[STARTUP] Initializing database...")
+    from auth.database import init_database
+    init_database()
+    
+    print("[STARTUP] Warming up Continental Food Retrieval System (CLIP)...")
+    # Eager load the new CLIP retrieval system
+    continental_system = get_continental_retrieval_system()
+    print("[STARTUP] System READY!")
+
+
+# =============================================================================
+# GLOBAL STATE & SERVICES
+# =============================================================================
+
+# Food Recognition & Nutrition
+# Food Recognition & Nutrition
+continental_system = get_continental_retrieval_system()
+nutrition_registry = get_nutrition_registry()
+nutrition_registry = get_nutrition_registry()
+
+# Default demo user
+demo_user = UserProfile(
+    user_id="demo-user",
+    name="Demo User",
+    conditions=[HealthCondition.DIABETES],
+    allergens=["peanuts"],
+    daily_targets=DailyTargets.for_diabetes(),
+)
+
+# In-memory meal log storage (per user)
+# Format: { user_id: [{ food_name, nutrition, timestamp, source }, ...] }
+user_meal_logs: Dict[str, List[Dict[str, Any]]] = {}
+
+# Current food context (most recently scanned food per user)
+# AI coach uses this for immediate context after food scan
+current_food_context: Dict[str, Dict[str, Any]] = {}
+
+# Services
+rule_engine = RuleEngine()
+meal_log_store = MealLogStore()
+analytics_service = AnalyticsService(meal_log_store)
+feedback_service = FeedbackService()
+virtual_coach = VirtualCoach(rule_engine, demo_user)
+
+
+# =============================================================================
+# REQUEST/RESPONSE MODELS
+# =============================================================================
+
+class ChatRequest(BaseModel):
+    message: str
+    food: Optional[Dict[str, Any]] = None
+
+
+class ChatResponse(BaseModel):
+    message: str
+    safety_level: str
+    confidence: float
+    violations: List[Dict[str, Any]] = []
+    suggestions: List[Dict[str, Any]] = []
+
+
+class FoodInput(BaseModel):
+    name: str
+    serving_size: float = 100
+    serving_unit: str = "g"
+    calories: float
+    protein_g: float = 0
+    carbs_g: float = 0
+    fat_g: float = 0
+    sugar_g: float = 0
+    fiber_g: float = 0
+    sodium_mg: float = 0
+
+
+class LogMealRequest(BaseModel):
+    foods: List[FoodInput]
+
+
+class FeedbackRequest(BaseModel):
+    context_type: str
+    context_id: str
+    rating: str  # helpful, not_helpful, incorrect
+    comment: Optional[str] = None
+
+
+# =============================================================================
+# AUTHENTICATION DEPENDENCY
+# =============================================================================
+
+async def get_current_user(authorization: Optional[str] = Header(None)):
+    """Dependency to get current authenticated user."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    token = authorization.replace("Bearer ", "")
+    payload = auth_service.verify_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    
+    return payload
+
+
+async def get_optional_user(authorization: Optional[str] = Header(None)):
+    """Dependency to get current user or None (for demo mode)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    
+    token = authorization.replace("Bearer ", "")
+    payload = auth_service.verify_token(token)
+    
+    return payload  # Returns None if invalid
+
+
+def get_user_profile_for_rules(user_id: str = "demo_user_123") -> UserProfile:
+    """
+    Load user's medical profile from database and construct a UserProfile
+    object with proper HealthCondition enums for rule engine evaluation.
+    
+    This ensures the rule engine uses the user's ACTUAL conditions,
+    not hardcoded demo values.
+    """
+    # Try to get profile from database
+    db_profile = MedicalProfileRepository.get_by_user_id(user_id)
+    
+    if not db_profile:
+        # Fall back to demo user if no profile exists
+        return demo_user
+    
+    # Map condition strings to HealthCondition enums
+    conditions = []
+    for condition_str in db_profile.get("conditions", []):
+        condition_lower = condition_str.lower()
+        if "diabetes" in condition_lower:
+            conditions.append(HealthCondition.DIABETES)
+        elif "hypertension" in condition_lower or "blood pressure" in condition_lower:
+            conditions.append(HealthCondition.HYPERTENSION)
+        elif "obesity" in condition_lower or "overweight" in condition_lower:
+            conditions.append(HealthCondition.OBESITY)
+        # Log unknown conditions for debugging
+        else:
+            print(f"[RuleEngine] Unknown condition: {condition_str}")
+    
+    # Get allergens from database
+    allergens = db_profile.get("allergens", [])
+    
+    # Determine daily targets based on conditions
+    if HealthCondition.DIABETES in conditions:
+        targets = DailyTargets.for_diabetes()
+    elif HealthCondition.HYPERTENSION in conditions:
+        targets = DailyTargets.for_hypertension()
+    elif HealthCondition.OBESITY in conditions:
+        targets = DailyTargets.for_weight_loss()
+    else:
+        targets = DailyTargets()
+    
+    # Create UserProfile with actual conditions
+    user_profile = UserProfile(
+        user_id=user_id,
+        name=db_profile.get("name", "User"),
+        conditions=conditions,
+        allergens=allergens,
+        daily_targets=targets,
+    )
+    
+    print(f"[RuleEngine] Loaded profile for {user_id}: conditions={[c.value for c in conditions]}, allergens={allergens}")
+    
+    return user_profile
+
+
+# =============================================================================
+# ROUTES: INDEX
+# =============================================================================
+
+@app.get("/")
+async def index():
+    """Redirect to login page."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/static/login.html")
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint for container orchestration.
+    
+    Used by:
+    - Docker HEALTHCHECK
+    - Kubernetes liveness/readiness probes
+    - Load balancer health checks
+    """
+    return {
+        "status": "healthy",
+        "version": "4.0.0",
+        "environment": os.getenv("ENVIRONMENT", "development"),
+        "services": {
+            "rule_engine": "ok",
+            "coach": "ok",
+            "analytics": "ok",
+            "feedback": "ok",
+        },
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# =============================================================================
+# ROUTES: COACH
+# =============================================================================
+
+@app.post("/api/coach/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """Chat with the Virtual Coach using RAG + Mistral LLM."""
+    try:
+        user_id = "demo_user_123"  # Demo mode
+        
+        # =====================================================
+        # RAG STEP 1: RETRIEVAL - Auto-fetch food context
+        # =====================================================
+        food_data = None
+        
+        # Priority 1: Use food from request if provided
+        if request.food and request.food.get("name"):
+            food_data = request.food
+            print(f"[RAG] Using food from request: {food_data.get('name')}")
+        
+        # Priority 2: Auto-retrieve from current_food_context (last scanned food)
+        elif user_id in current_food_context:
+            ctx = current_food_context[user_id]
+            food_data = {
+                "name": ctx.get("food_name"),
+                "calories": ctx["nutrition"]["calories"],
+                "protein_g": ctx["nutrition"]["protein_g"],
+                "carbs_g": ctx["nutrition"]["carbs_g"],
+                "fat_g": ctx["nutrition"]["fat_g"],
+                "sugar_g": ctx["nutrition"]["sugar_g"],
+                "fiber_g": ctx["nutrition"]["fiber_g"],
+                "sodium_mg": ctx["nutrition"]["sodium_mg"],
+            }
+            print(f"[RAG] Auto-retrieved food context: {food_data.get('name')}")
+        else:
+            print(f"[RAG] No food context available")
+        
+        # =====================================================
+        # RAG STEP 2: AUGMENTATION - Build Food object
+        # =====================================================
+        food = None
+        if food_data and food_data.get("name"):
+            # Get values with defaults
+            calories = float(food_data.get("calories", 0) or 0)
+            protein_g = float(food_data.get("protein_g", 0) or 0)
+            carbs_g = float(food_data.get("carbs_g", 0) or 0)
+            fat_g = float(food_data.get("fat_g", 0) or 0)
+            sugar_g = float(food_data.get("sugar_g", 0) or 0)
+            fiber_g = float(food_data.get("fiber_g", 0) or 0)
+            sodium_mg = float(food_data.get("sodium_mg", 0) or 0)
+            
+            # Ensure carbs >= sugar + fiber (validation requirement)
+            if carbs_g < sugar_g + fiber_g:
+                carbs_g = sugar_g + fiber_g
+            
+            food = Food(
+                food_id=f"input-{datetime.now().timestamp()}",
+                name=food_data.get("name", "Unknown Food"),
+                serving_size=float(food_data.get("serving_size", 100) or 100),
+                serving_unit=food_data.get("serving_unit", "g") or "g",
+                nutrition=NutritionInfo(
+                    calories=calories,
+                    protein_g=protein_g,
+                    carbs_g=carbs_g,
+                    fat_g=fat_g,
+                    sugar_g=sugar_g,
+                    fiber_g=fiber_g,
+                    sodium_mg=sodium_mg,
+                ),
+                allergens=food_data.get("allergens") or [],
+            )
+            print(f"[RAG] Built Food object: {food.name} ({food.nutrition.calories} cal)")
+        
+        # =====================================================
+        # RAG STEP 3: GENERATION - Use Ollama/Gemma with RAG context
+        # =====================================================
+        llm_service = get_llm_service()
+        rag_service = get_rag_service()
+        
+        # Build comprehensive RAG context from user data
+        rag_context = rag_service.build_context(
+            user_id=user_id,
+            meal_logs=user_meal_logs,
+            current_food=food_data,
+            user_question=request.message
+        )
+        print(f"[RAG] Built context: {len(rag_context)} chars")
+        
+        # Try LLM-powered response if available
+        if llm_service.is_available:
+            print(f"[Coach] LLM is available, calling chat...")
+            llm_response = llm_service.chat(
+                prompt=request.message,
+                system_prompt="nutrition_coach",
+                rag_context=rag_context
+            )
+            
+            if llm_response.success:
+                print(f"[Coach] Using Ollama/Gemma LLM with RAG context")
+                
+                # Get user profile data to show in response
+                profile = rag_service.get_medical_profile(user_id)
+                profile_header = ""
+                if profile and (profile.get('conditions') or profile.get('allergens')):
+                    profile_header = "📋 **Your Health Profile:**\n"
+                    if profile.get('conditions'):
+                        profile_header += f"• Conditions: {', '.join(profile['conditions'])}\n"
+                    if profile.get('allergens'):
+                        profile_header += f"• Allergens: {', '.join(profile['allergens'])}\n"
+                    if profile.get('medications'):
+                        profile_header += f"• Medications: {', '.join(profile['medications'])}\n"
+                    if profile.get('_is_demo'):
+                        profile_header += "_(Demo profile - upload your medical report for personalized data)_\n"
+                    profile_header += "\n---\n\n"
+                
+                # Still run rule engine for safety checks
+                violations = []
+                safety_level = "safe"
+                if food:
+                    from rules.engine import RuleEngine
+                    rule_engine_local = RuleEngine()
+                    user_profile = get_user_profile_for_rules(user_id)
+                    rule_violations = rule_engine_local.evaluate(food, user_profile)
+                    violations = [v.to_dict() for v in rule_violations]
+                    verdict = rule_engine_local.get_final_verdict(rule_violations)
+                    safety_level = verdict.value
+                
+                return ChatResponse(
+                    message=profile_header + llm_response.content,
+                    safety_level=safety_level,
+                    confidence=0.9,
+                    violations=violations,
+                    suggestions=[{"type": "llm_powered", "source": "ollama_gemma", "rag_enabled": True}],
+                )
+            else:
+                print(f"[Coach] LLM response failed: {llm_response.error}")
+        else:
+            print(f"[Coach] LLM service not available, using fallback")
+        
+        # Fallback to original rule-based coach - STILL SHOW PROFILE DATA
+        profile = rag_service.get_medical_profile(user_id)
+        profile_header = ""
+        if profile and (profile.get('conditions') or profile.get('allergens')):
+            profile_header = "📋 **Your Health Profile:**\n"
+            if profile.get('conditions'):
+                profile_header += f"• Conditions: {', '.join(profile['conditions'])}\n"
+            if profile.get('allergens'):
+                profile_header += f"• Allergens: {', '.join(profile['allergens'])}\n"
+            if profile.get('medications'):
+                profile_header += f"• Medications: {', '.join(profile['medications'])}\n"
+            profile_header += "\n---\n\n"
+        
+        response = virtual_coach.respond(request.message, food=food)
+        
+        return ChatResponse(
+            message=profile_header + response.message,
+            safety_level=response.safety_level,
+            confidence=response.confidence,
+            violations=response.violations,
+            suggestions=response.suggestions,
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/coach/history")
+async def get_history():
+    """Get conversation history."""
+    return {
+        "session_id": virtual_coach.context.session_id,
+        "messages": [m.to_dict() for m in virtual_coach.context.messages],
+    }
+
+
+@app.post("/api/coach/clear")
+async def clear_history():
+    """Clear conversation history."""
+    virtual_coach.clear_context()
+    return {"status": "cleared"}
+
+
+# =============================================================================
+# ROUTES: EXERCISE GUIDANCE AI
+# =============================================================================
+
+class ExerciseRequest(BaseModel):
+    message: str
+
+# Simple exercise knowledge base
+EXERCISE_DATA = {
+    "calorie_burn": {
+        "walking": 4,      # cal per minute
+        "running": 11,
+        "cycling": 8,
+        "swimming": 10,
+        "yoga": 3,
+        "weight_training": 5,
+        "hiit": 12,
+        "dancing": 6,
+        "jumping_rope": 12,
+    },
+    "met_values": {
+        "walking": 3.5,
+        "running": 9.8,
+        "cycling": 7.5,
+        "swimming": 8.0,
+        "yoga": 2.5,
+    }
+}
+
+@app.post("/api/exercise/chat")
+async def exercise_chat(request: ExerciseRequest):
+    """
+    Exercise Guidance AI - provides general fitness advice.
+    Uses Ollama/Gemma LLM for intelligent responses.
+    Shows user health profile for personalized context.
+    """
+    user_id = "demo_user_123"
+    message = request.message.lower().strip()
+    
+    # Get user profile for personalized advice
+    rag_service = get_rag_service()
+    profile = rag_service.get_medical_profile(user_id)
+    
+    # Build profile header to show in response
+    profile_header = ""
+    if profile and (profile.get('conditions') or profile.get('allergens')):
+        profile_header = "📋 **Your Health Profile:**\n"
+        if profile.get('conditions'):
+            profile_header += f"• Conditions: {', '.join(profile['conditions'])}\n"
+        if profile.get('allergens'):
+            profile_header += f"• Allergens: {', '.join(profile['allergens'])}\n"
+        if profile.get('medications'):
+            profile_header += f"• Medications: {', '.join(profile['medications'])}\n"
+        if profile.get('_is_demo'):
+            profile_header += "_(Demo profile - upload your medical report for personalized data)_\n"
+        profile_header += "\n---\n\n"
+    
+    # Disclaimer to include in responses
+    disclaimer = "\n\n_This is general guidance only, not medical advice. Consult a healthcare provider before starting any exercise program._"
+    
+    # Check for dangerous/medical questions
+    dangerous_keywords = ["injury", "pain", "hurt", "chest pain", "dizzy", "faint", "pregnant", "surgery", "heart condition"]
+    if any(kw in message for kw in dangerous_keywords):
+        return {
+            "message": profile_header + "That sounds like a medical concern. Please consult a healthcare professional or doctor before exercising. Your safety is the priority!" + disclaimer,
+            "type": "safety_warning"
+        }
+    
+    # Try LLM-powered response first
+    llm_service = get_llm_service()
+    if llm_service.is_available:
+        # Build RAG context for personalized exercise advice
+        rag_context = f"""=== USER HEALTH PROFILE ===
+Health Conditions: {', '.join(profile.get('conditions', [])) if profile else 'None'}
+Allergens: {', '.join(profile.get('allergens', [])) if profile else 'None'}
+Medications: {', '.join(profile.get('medications', [])) if profile else 'None'}
+
+Consider these health conditions when providing exercise advice."""
+        
+        llm_response = llm_service.chat(
+            prompt=request.message,
+            system_prompt="exercise_guide",
+            rag_context=rag_context
+        )
+        if llm_response.success:
+            return {
+                "message": profile_header + llm_response.content + disclaimer,
+                "type": "llm_response",
+                "powered_by": "ollama_gemma"
+            }
+    
+    # Fallback to rule-based responses
+    # Calorie burn questions
+    if "burn" in message or "calorie" in message:
+        response = "**Estimated Calorie Burn (per minute):**\n"
+        response += "• Walking: ~4 cal/min\n"
+        response += "• Running: ~11 cal/min\n"
+        response += "• Cycling: ~8 cal/min\n"
+        response += "• Swimming: ~10 cal/min\n"
+        response += "• HIIT: ~12 cal/min\n"
+        response += "• Weight training: ~5 cal/min\n"
+        response += "• Yoga: ~3 cal/min\n\n"
+        response += "These are approximate values for a 70kg person. Actual burn varies based on intensity and body weight."
+        return {"message": profile_header + response + disclaimer, "type": "calorie_info"}
+    
+    # Exercise recommendations
+    if "recommend" in message or "suggest" in message or "should i" in message:
+        response = "**General Exercise Recommendations:**\n\n"
+        response += "• **Beginners:** Start with 20-30 min walking, 3x per week\n"
+        response += "• **Cardio:** 150 min moderate OR 75 min vigorous per week\n"
+        response += "• **Strength:** 2-3 sessions per week, all major muscle groups\n"
+        response += "• **Flexibility:** Daily stretching or yoga\n\n"
+        response += "Start slowly and gradually increase intensity!"
+        return {"message": profile_header + response + disclaimer, "type": "recommendation"}
+    
+    # Weight loss questions
+    if "lose weight" in message or "weight loss" in message or "fat" in message:
+        response = "**Weight Loss Exercise Tips:**\n\n"
+        response += "1. **Combine cardio + strength training**\n"
+        response += "2. **HIIT** is time-efficient for burning calories\n"
+        response += "3. **Aim for 300+ min of moderate exercise per week**\n"
+        response += "4. **Add walking** throughout the day (10,000 steps goal)\n"
+        response += "5. **Consistency** matters more than intensity\n\n"
+        response += "Remember: Diet + exercise work together for weight loss."
+        return {"message": profile_header + response + disclaimer, "type": "weight_loss"}
+    
+    # Muscle building
+    if "muscle" in message or "strength" in message or "build" in message:
+        response = "**Muscle Building Basics:**\n\n"
+        response += "1. **Lift weights** 3-4 times per week\n"
+        response += "2. **Progressive overload** - gradually increase weight\n"
+        response += "3. **Compound exercises:** squats, deadlifts, bench press\n"
+        response += "4. **Rest:** 48 hours between same muscle groups\n"
+        response += "5. **Protein intake:** important for muscle recovery"
+        return {"message": profile_header + response + disclaimer, "type": "strength"}
+    
+    # Default helpful response
+    response = "I'm your Exercise Guidance AI! I can help with:\n\n"
+    response += "• **Calorie burn estimates** - \"How many calories does running burn?\"\n"
+    response += "• **Exercise recommendations** - \"What exercises should I do?\"\n"
+    response += "• **Weight loss tips** - \"How to exercise for weight loss?\"\n"
+    response += "• **Strength training** - \"How to build muscle?\"\n\n"
+    response += "Ask me anything about fitness and exercise!"
+    
+    return {"message": profile_header + response + disclaimer, "type": "general"}
+
+
+# =============================================================================
+# ROUTES: FIX MY MEAL (Clinical Nutrition AI)
+# =============================================================================
+
+class FixMealRequest(BaseModel):
+    food_name: Optional[str] = None
+    nutrition: Optional[Dict[str, Any]] = None
+    # If not provided, will auto-fetch from current_food_context
+
+# Medical thresholds for conditions
+CONDITION_THRESHOLDS = {
+    "diabetes": {"sugar_g": 10, "carbs_g": 45},
+    "hypertension": {"sodium_mg": 500},
+    "high_cholesterol": {"fat_g": 15, "saturated_fat_g": 5},
+    "kidney_disease": {"sodium_mg": 400, "protein_g": 20},
+    "obesity": {"calories": 400, "fat_g": 15},
+}
+
+@app.post("/api/meal/fix")
+async def fix_meal_endpoint(request: FixMealRequest, user: dict = Depends(get_optional_user)):
+    """
+    Clinical Nutrition AI - analyzes meal and suggests improvements.
+    Uses detected food data, portion estimation, and user medical profile.
+    Provides actionable fix suggestions based on nutritional analysis.
+    """
+    if not user:
+        user = {"sub": "demo_user_123"}
+    
+    user_id = user["sub"]
+    
+    # Get food data - from request or auto-fetch from context
+    food_name = request.food_name
+    nutrition = request.nutrition
+    portion_grams = 100  # Default portion size
+    
+    if not food_name or not nutrition:
+        # Auto-fetch from current_food_context
+        if user_id in current_food_context:
+            ctx = current_food_context[user_id]
+            food_name = ctx.get("food_name", "Unknown Food")
+            nutrition = ctx.get("nutrition", {})
+            # Try to get portion estimate if available
+            portion_grams = ctx.get("portion_grams", 100)
+        else:
+            return {
+                "verdict": "No Data",
+                "message": "No food data available. Please scan a food item first.",
+                "problems": [],
+                "suggestions": {}
+            }
+    
+    # Get user medical profile and conditions
+    profile = MedicalProfileRepository.get_by_user_id(user_id)
+    conditions = []
+    if profile:
+        conditions = profile.get("conditions", [])
+    
+    # Build detected items list for the meal fix service
+    detected_items = [{
+        "name": food_name,
+        "grams": portion_grams,
+        # Pass nutrition directly if we have it
+        "nutrition_override": nutrition
+    }]
+    
+    # Use the new MealFixService for smart analysis
+    try:
+        from services.meal_fix_service import get_meal_fix_service
+        meal_fix = get_meal_fix_service()
+        
+        # Run analysis
+        result = meal_fix.analyze_meal(detected_items, conditions)
+        
+        if result.get("success"):
+            analysis = result.get("analysis", {})
+            suggestions = result.get("suggestions", [])
+            totals = analysis.get("totals", {})
+            
+            # Build formatted response with emoji template
+            if result.get("verdict") == "Healthy":
+                formatted_response = f"✅ This meal is suitable for your dietary needs.\n\n"
+                formatted_response += f"📊 Nutrition Summary:\n"
+                formatted_response += f"  • Calories: {totals.get('calories', 0):.0f} kcal\n"
+                formatted_response += f"  • Protein: {totals.get('protein_g', 0):.0f}g\n"
+                formatted_response += f"  • Carbs: {totals.get('carbs_g', 0):.0f}g\n"
+                formatted_response += f"  • Fat: {totals.get('fat_g', 0):.0f}g\n"
+            else:
+                formatted_response = f"⚠️ This meal needs some adjustments based on your health profile.\n\n"
+                
+                # List problems with icons
+                formatted_response += "❌ Issues Found:\n"
+                for s in suggestions:
+                    if s.get("type") == "warning":
+                        formatted_response += f"  {s.get('icon', '⚠️')} {s.get('title')}: {s.get('message')}\n"
+                
+                # List fixes
+                formatted_response += "\n💡 How to Fix:\n"
+                for s in suggestions:
+                    if s.get("fix"):
+                        formatted_response += f"  • {s.get('fix')}\n"
+                
+                # Nutrition summary
+                formatted_response += f"\n📊 Current Nutrition:\n"
+                formatted_response += f"  • Calories: {totals.get('calories', 0):.0f} kcal\n"
+                formatted_response += f"  • Protein: {totals.get('protein_g', 0):.0f}g\n"
+                formatted_response += f"  • Carbs: {totals.get('carbs_g', 0):.0f}g\n"
+                formatted_response += f"  • Sugar: {totals.get('sugar_g', 0):.0f}g\n"
+                formatted_response += f"  • Sodium: {totals.get('sodium_mg', 0):.0f}mg\n"
+            
+            # Try LLM enhancement if available
+            llm_suggestions = None
+            llm_service = get_llm_service()
+            
+            if llm_service.is_available and suggestions:
+                try:
+                    # Build simple context string instead of raw dict for model efficiency
+                    context_lines = [
+                        f"Current Meal: {food_name}",
+                        f"Health Profile: {', '.join(conditions) if conditions else 'No specific conditions'}"
+                    ]
+                    
+                    # Add current nutrition
+                    nut_str = f"Calories: {totals.get('calories',0)}, Protein: {totals.get('protein_g',0)}g, Sugar: {totals.get('sugar_g',0)}g"
+                    context_lines.append(f"Nutrition: {nut_str}")
+                    
+                    # Detailed issues list
+                    issues_str = "\n".join([
+                        f"- {s.get('title')}: {s.get('message')}"
+                        for s in suggestions if s.get("type") == "warning"
+                    ])
+                    
+                    fix_prompt = f"""Analyze this meal and provide 3 quick, practical fixes.
+                    
+MEAL INFO: {food_name}
+ISSUES:
+{issues_str}
+
+USER CONDITIONS: {', '.join(conditions) if conditions else 'None'}"""
+                    
+                    llm_response = llm_service.chat(
+                        prompt=fix_prompt,
+                        system_prompt="clinical_nutritionist",
+                        rag_context="\n".join(context_lines)
+                    )
+                    if llm_response.success:
+                        llm_suggestions = llm_response.content
+                        formatted_response += f"\n\n🤖 AI Dietitian's Advice:\n{llm_suggestions}"
+                except Exception as e:
+                    print(f"[MEAL FIX] LLM enhancement error: {e}")
+            
+            return {
+                "verdict": result.get("verdict"),
+                "message": result.get("message"),
+                "formatted_response": formatted_response,
+                "food_name": food_name,
+                "portion_grams": portion_grams,
+                "nutrition": totals,
+                "targets": result.get("targets", {}),
+                "problems": [
+                    {
+                        "category": s.get("category"),
+                        "title": s.get("title"),
+                        "message": s.get("message")
+                    }
+                    for s in suggestions if s.get("type") == "warning"
+                ],
+                "suggestions": [
+                    {
+                        "category": s.get("category"),
+                        "fix": s.get("fix")
+                    }
+                    for s in suggestions if s.get("fix")
+                ],

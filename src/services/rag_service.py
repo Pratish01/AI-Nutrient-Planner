@@ -9,9 +9,9 @@ This enables personalized AI responses based on:
 """
 
 import os
-import csv
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
+from services.nutrition_registry import get_nutrition_registry
 
 
 class RAGService:
@@ -21,66 +21,16 @@ class RAGService:
     Retrieves and formats context from:
     1. User medical profiles (conditions, allergens, medications)
     2. User meal logs (recent meals)
-    3. Food database (healthy_eating_dataset.csv)
+    3. Food database (via NutritionRegistry)
     """
     
     def __init__(self):
         """Initialize RAG service with food database."""
-        self.food_db = self._load_food_database()
-        print(f"[RAG] Loaded {len(self.food_db)} meals from healthy_eating_dataset.csv")
-    
-    def _load_food_database(self) -> Dict[str, Dict[str, Any]]:
-        """Load food database from Indian_Food_Nutrition_Processed.csv."""
-        food_db = {}
-        
-        # Try Indian food nutrition dataset first
-        csv_path = os.path.join(
-            os.path.dirname(__file__), 
-            "..", "..", "data", "Indian_Food_Nutrition_Processed.csv"
-        )
-        
-        # Fallback options
-        if not os.path.exists(csv_path):
-            csv_path = os.path.join(
-                os.path.dirname(__file__), 
-                "..", "..", "data", "healthy_eating_dataset.csv"
-            )
-        if not os.path.exists(csv_path):
-            csv_path = os.path.join(
-                os.path.dirname(__file__), 
-                "..", "..", "data", "sample_foods.csv"
-            )
-        
-        try:
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    # Support multiple column name formats
-                    dish_name = (
-                        row.get('Dish Name') or  # Indian Food dataset
-                        row.get('meal_name') or  # healthy_eating_dataset
-                        row.get('name')          # sample_foods
-                    )
-                    if dish_name:
-                        food_db[dish_name.lower()] = {
-                            'name': dish_name,
-                            # Indian food nutrition columns
-                            'calories': float(row.get('Calories (kcal)', 0) or row.get('calories', 0) or 0),
-                            'protein_g': float(row.get('Protein (g)', 0) or row.get('protein_g', 0) or 0),
-                            'carbs_g': float(row.get('Carbohydrates (g)', 0) or row.get('carbs_g', 0) or 0),
-                            'fat_g': float(row.get('Fats (g)', 0) or row.get('fat_g', 0) or 0),
-                            'fiber_g': float(row.get('Fibre (g)', 0) or row.get('fiber_g', 0) or 0),
-                            'sugar_g': float(row.get('Free Sugar (g)', 0) or row.get('sugar_g', 0) or 0),
-                            'sodium_mg': float(row.get('Sodium (mg)', 0) or row.get('sodium_mg', 0) or 0),
-                            'calcium_mg': float(row.get('Calcium (mg)', 0) or 0),
-                            'iron_mg': float(row.get('Iron (mg)', 0) or 0),
-                            'vitamin_c_mg': float(row.get('Vitamin C (mg)', 0) or 0),
-                            'folate_ug': float(row.get('Folate (µg)', 0) or 0),
-                        }
-        except Exception as e:
-            print(f"[RAG] Warning: Could not load food database: {e}")
-        
-        return food_db
+        self.registry = get_nutrition_registry()
+        # Maintain food_db for compatibility, but map to Registry names
+        self.food_db = {item['name'].lower(): item for item in self.registry.get_all()}
+        print(f"[RAG] Service initialized using NutritionRegistry ({len(self.food_db)} items)")
+
     
     def get_medical_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
         """

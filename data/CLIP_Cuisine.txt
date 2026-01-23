@@ -1,0 +1,16 @@
+# Cuisine Classification Prompts with Visual Descriptors
+# Multiple templates for ensemble voting
+
+# Indian Food - Multiple templates
+a photo of Indian food
+a photograph of traditional Indian cuisine
+Indian food served on a plate
+a meal from India with spices and curry
+Indian cuisine with vibrant colors and spices
+
+# Continental Food - Multiple templates  
+a photo of continental food
+a photograph of Western cuisine
+continental European food on a plate
+Western style meal with meat and vegetables
+European cuisine with clean presentation

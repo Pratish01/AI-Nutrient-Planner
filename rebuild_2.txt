@@ -1,0 +1,695 @@
+                "conditions_checked": conditions
+            }
+            
+    except ImportError as ie:
+        print(f"[MEAL FIX] MealFixService import error: {ie}")
+    except Exception as e:
+        print(f"[MEAL FIX] Analysis error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Fallback to basic analysis if MealFixService fails
+    print(f"[MEAL FIX] Running basic fallback analysis for {food_name}")
+    calories = nutrition.get("calories", 0)
+    carbs = nutrition.get("carbs_g", 0)
+    sugar = nutrition.get("sugar_g", 0)
+    sodium = nutrition.get("sodium_mg", 0)
+    protein = nutrition.get("protein_g", 0)
+    
+    problems = []
+    suggestions_list = []
+    
+    # Basic checks
+    if sugar > 15:
+        problems.append({"title": "High Sugar", "message": f"Sugar content is {sugar}g (limit: 15g)"})
+        suggestions_list.append({"category": "sugar", "fix": "Choose unsweetened alternatives or non-starchy vegetables."})
+    if sodium > 600:
+        problems.append({"title": "High Sodium", "message": f"Sodium is {sodium}mg (limit: 600mg)"})
+        suggestions_list.append({"category": "sodium", "fix": "Use herbs and spices instead of salt. Avoid processed toppings."})
+    if protein < 15:
+        problems.append({"title": "Low Protein", "message": f"Only {protein}g protein (need 15-25g)"})
+        suggestions_list.append({"category": "protein", "fix": "Add a protein source like eggs, paneer, dal, or lean meat."})
+    
+    verdict = "Healthy" if not problems else "Needs Fix"
+    
+    # Build a more descriptive formatted response for the fallback
+    if verdict == "Healthy":
+        formatted_response = f"✅ Your meal '{food_name}' looks well-balanced."
+    else:
+        formatted_response = f"⚠️ Issues found in your meal '{food_name}':\n\n"
+        for p in problems:
+            formatted_response += f"• **{p['title']}**: {p['message']}\n"
+        formatted_response += "\n💡 Quick Fix:\n"
+        for s in suggestions_list:
+            formatted_response += f"• {s['fix']}\n"
+    
+    return {
+        "verdict": verdict,
+        "message": f"Analyzed {food_name}" + (f" with {len(problems)} issues" if problems else ""),
+        "formatted_response": formatted_response,
+        "food_name": food_name,
+        "nutrition": nutrition,
+        "problems": problems,
+        "suggestions": suggestions_list,
+        "conditions_checked": conditions
+    }
+
+
+# =============================================================================
+# ROUTES: ANALYTICS
+# =============================================================================
+
+@app.get("/api/analytics/score")
+async def get_health_score():
+    """Get current health score."""
+    score = analytics_service.compute_health_score(
+        demo_user.user_id,
+        demo_user.daily_targets,
+    )
+    return score.to_dict()
+
+
+@app.get("/api/analytics/trends")
+async def get_trends(days: int = 7):
+    """Get nutrient trends."""
+    trends = analytics_service.compute_daily_trends(
+        demo_user.user_id,
+        demo_user.daily_targets,
+        days=days,
+    )
+    return {k: v.to_dict() for k, v in trends.items()}
+
+
+@app.get("/api/analytics/patterns")
+async def get_patterns(days: int = 14):
+    """Get detected behavior patterns."""
+    patterns = analytics_service.detect_patterns(
+        demo_user.user_id,
+        demo_user.daily_targets,
+        days=days,
+    )
+    return [p.to_dict() for p in patterns]
+
+
+@app.get("/api/analytics/insight")
+async def get_insight():
+    """Get daily actionable insight."""
+    insight = analytics_service.generate_insight(
+        demo_user.user_id,
+        demo_user.daily_targets,
+    )
+    return {"insight": insight}
+
+
+@app.get("/api/analytics/snapshot")
+async def get_snapshot():
+    """Get complete analytics snapshot."""
+    snapshot = analytics_service.get_snapshot(
+        demo_user.user_id,
+        demo_user.daily_targets,
+    )
+    return snapshot.to_dict()
+
+
+@app.get("/api/analytics/feature-importance")
+async def get_feature_importance():
+    """
+    Get feature importance analysis for health predictions.
+    
+    Returns rankings of nutritional features based on their importance
+    for predicting various health conditions (diabetes, hypertension, etc.).
+    """
+    try:
+        from analytics.feature_selection import analyze_features
+        results = analyze_features()
+        return {
+            "status": "success",
+            "data": results
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+
+# =============================================================================
+# ROUTES: FOOD
+# =============================================================================
+
+
+@app.post("/api/food/analyze")
+async def analyze_food(food: FoodInput):
+    """Analyze a food item for safety."""
+    # Ensure carbs >= sugar + fiber (validation requirement)
+    carbs_g = food.carbs_g
+    if carbs_g < food.sugar_g + food.fiber_g:
+        carbs_g = food.sugar_g + food.fiber_g
+    
+    # Load user's actual profile for rule evaluation
+    user_profile = get_user_profile_for_rules("demo_user_123")
+    
+    food_obj = Food(
+        food_id=f"analyze-{datetime.now().timestamp()}",
+        name=food.name,
+        serving_size=food.serving_size,
+        serving_unit=food.serving_unit,
+        nutrition=NutritionInfo(
+            calories=food.calories,
+            protein_g=food.protein_g,
+            carbs_g=carbs_g,
+            fat_g=food.fat_g,
+            sugar_g=food.sugar_g,
+            fiber_g=food.fiber_g,
+            sodium_mg=food.sodium_mg,
+        ),
+        allergens=[],
+    )
+    
+    violations = rule_engine.evaluate(food_obj, user_profile)
+    verdict = rule_engine.get_final_verdict(violations)
+    
+    return {
+        "food": food.name,
+        "verdict": verdict.value,
+        "violations": [v.to_dict() for v in violations],
+        "formatted": rule_engine.format_violations(violations),
+    }
+
+
+@app.post("/api/food/log")
+async def log_meal(request: LogMealRequest):
+    """Log a meal."""
+    foods = []
+    for f in request.foods:
+        foods.append({
+            "name": f.name,
+            "calories": f.calories,
+            "protein_g": f.protein_g,
+            "carbs_g": f.carbs_g,
+            "fat_g": f.fat_g,
+            "sugar_g": f.sugar_g,
+            "fiber_g": f.fiber_g,
+            "sodium_mg": f.sodium_mg,
+        })
+    
+    entry = analytics_service.log_meal(
+        user_id=demo_user.user_id,
+        foods=foods,
+    )
+    
+    return {
+        "log_id": entry.log_id,
+        "total_nutrition": entry.total_nutrition,
+        "meal_type": entry.meal_type,
+    }
+
+
+# =============================================================================
+# ROUTES: FEEDBACK
+# =============================================================================
+
+@app.post("/api/feedback")
+async def submit_feedback(request: FeedbackRequest):
+    """Submit feedback on a response."""
+    feedback = feedback_service.submit_feedback(
+        user_id=demo_user.user_id,
+        context_type=request.context_type,
+        context_id=request.context_id,
+        rating=request.rating,
+        comment=request.comment,
+    )
+    return {"feedback_id": feedback.feedback_id, "status": "submitted"}
+
+
+# =============================================================================
+# ROUTES: USER
+# =============================================================================
+
+@app.get("/api/profile")
+async def get_profile(user: dict = None):
+    """
+    Get current user's medical profile from database.
+    TEMP: Auth optional for testing.
+    """
+    # For testing: use demo user if no auth
+    if not user:
+        user = {"sub": "demo_user_123"}
+    
+    user_id = user["sub"]
+    print(f"[API] Loading profile for user: {user_id}")
+    
+    # Get profile from database (from OCR extraction)
+    profile = MedicalProfileRepository.get_by_user_id(user_id)
+    
+    if not profile:
+        print(f"[API] No profile found for user: {user_id}")
+        # Return empty profile instead of 404
+        return {
+            "user_id": user_id,
+            "conditions": [],
+            "allergies": [],
+            "medications": [],
+            "daily_targets": {},
+            "vitals": {
+                "glucose_level": None,
+                "cholesterol": None
+            },
+            "source": "none",
+            "message": "No medical profile yet. Upload a report."
+        }
+    
+    print(f"[API] Found profile: conditions={profile.get('conditions')}, allergens={profile.get('allergens')}")
+    
+    # Extract vitals from daily_targets if available
+    daily_targets = profile.get("daily_targets", {})
+    vitals = {
+        "glucose_level": daily_targets.get("glucose_level") or daily_targets.get("sugar_level"),
+        "cholesterol": daily_targets.get("cholesterol"),
+    }
+    
+    return {
+        "user_id": user_id,
+        "conditions": profile.get("conditions", []),
+        "allergies": profile.get("allergens", []),
+        "medications": profile.get("medications", []),
+        "daily_targets": daily_targets,
+        "vitals": vitals,
+        "source": "medical_report_ocr",
+        "source_file": profile.get("source_file"),
+        "created_at": profile.get("created_at"),
+    }
+
+
+# Keep old endpoint for backward compatibility
+@app.get("/api/user/profile")
+async def get_user_profile_legacy(user: dict = Depends(get_current_user)):
+    """Legacy endpoint - redirects to /api/profile"""
+    return await get_profile(user)
+
+
+# =============================================================================
+# ROUTES: MEDICAL REPORT UPLOAD
+# =============================================================================
+
+@app.post("/api/medical-report/upload")
+async def upload_medical_report(
+    file: UploadFile = File(...),
+    user: dict = None,  # TEMP: Auth optional for testing
+):
+    """
+    Upload a medical report and extract conditions, allergens, and vitals.
+    Uses OCR to parse the document.
+    """
+    if not user:
+        user = {"sub": "demo_user_123"}
+    
+    user_id = user["sub"]
+    print(f"\n[MEDICAL REPORT] ====== Processing medical report ======")
+    print(f"[MEDICAL REPORT] User: {user_id}")
+    print(f"[MEDICAL REPORT] File: {file.filename}")
+    
+    try:
+        # Save the uploaded file temporarily
+        import tempfile
+        import os
+        
+        content = await file.read()
+        
+        # Get file extension
+        ext = os.path.splitext(file.filename)[1].lower() if file.filename else '.pdf'
+        
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        print(f"[MEDICAL REPORT] Saved to: {tmp_path}")
+        
+        # Parse the medical report using OCR
+        from ocr.parser import parse_medical_report
+        result = parse_medical_report(tmp_path)
+        
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+        
+        print(f"[MEDICAL REPORT] Conditions: {result.get('conditions', [])}")
+        print(f"[MEDICAL REPORT] Allergens: {result.get('allergens', [])}")
+        print(f"[MEDICAL REPORT] Vitals: {result.get('vitals', {})}")
+        
+        # Build daily_targets with vitals
+        daily_targets = result.get('vitals', {})
+        
+        # Save to database
+        import uuid
+        profile_id = str(uuid.uuid4())
+        
+        MedicalProfileRepository.create(
+            profile_id=profile_id,
+            user_id=user_id,
+            conditions=result.get('conditions', []),
+            allergens=result.get('allergens', []),
+            medications=[],
+            daily_targets=daily_targets,  # Contains vitals
+            raw_ocr_text=result.get('raw_text', '')[:5000],  # Limit size
+            source_file=file.filename,
+        )
+        
+        print(f"[MEDICAL REPORT] ✓ Saved profile: {profile_id}")
+        
+        return {
+            "success": True,
+            "profile_id": profile_id,
+            "conditions": result.get('conditions', []),
+            "allergens": result.get('allergens', []),
+            "vitals": result.get('vitals', {}),
+            "message": f"Extracted {len(result.get('conditions', []))} conditions, {len(result.get('allergens', []))} allergens, and vitals from report."
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[MEDICAL REPORT] Error: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Failed to process medical report"
+        }
+
+
+# =============================================================================
+# ROUTES: AUTHENTICATION
+# =============================================================================
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+@app.post("/auth/register")
+async def register(request: RegisterRequest):
+    """Register a new user."""
+    result = auth_service.register(request.email, request.password, request.name)
+    
+    if not result.success:
+        raise HTTPException(status_code=400, detail=result.error)
+    
+    return {
+        "user_id": result.user_id,
+        "token": result.token,
+        "name": request.name,
+    }
+
+
+@app.post("/auth/login")
+async def login(request: LoginRequest):
+    """Login and get JWT token."""
+    result = auth_service.login(request.email, request.password)
+    
+    if not result.success:
+        raise HTTPException(status_code=401, detail=result.error)
+    
+    user = auth_service.get_user(result.user_id)
+    
+    return {
+        "user_id": result.user_id,
+        "token": result.token,
+        "name": user.get("name", "User") if user else "User",
+    }
+
+
+@app.get("/auth/me")
+async def get_current_user_info(user: dict = Depends(get_current_user)):
+    """Get current user info."""
+    user_data = auth_service.get_user(user["sub"])
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user_data
+
+
+@app.post("/auth/logout")
+async def logout(user: dict = Depends(get_current_user)):
+    """
+    Logout the current user.
+    
+    For JWT-based auth, the actual token invalidation happens client-side
+    by removing the token from storage. This endpoint:
+    1. Confirms the user was authenticated
+    2. Can be extended to add token to a blacklist if needed
+    3. Provides a clean API contract for frontend logout flows
+    """
+    return {
+        "success": True,
+        "message": "Logged out successfully",
+        "user_id": user["sub"]
+    }
+
+
+# =============================================================================
+# ROUTES: PROFILE (Authenticated)
+# =============================================================================
+
+@app.get("/profile")
+async def get_medical_profile(user: dict = Depends(get_current_user)):
+    """Get authenticated user's medical profile."""
+    profile = MedicalProfileRepository.get_by_user_id(user["sub"])
+    
+    if not profile:
+        return {"message": "No profile found", "profile": None}
+    
+    return profile
+
+
+# =============================================================================
+# ROUTES: UPLOAD & OCR
+# =============================================================================
+
+@app.post("/upload/medical-report")
+async def upload_medical_report_legacy(
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    """
+    Upload medical report, run OCR, and create profile.
+    
+    Accepts PDF or image files.
+    """
+    # Validate file type
+    allowed_types = ["application/pdf", "image/jpeg", "image/png", "image/jpg"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: PDF, JPG, PNG"
+        )
+    
+    # Create upload record
+    upload_id = str(uuid.uuid4())
+    UploadRepository.create(upload_id, user["sub"], file.filename, file.content_type)
+    
+    try:
+        # Save file temporarily
+        content = await file.read()
+        
+        # Check file size (max 10MB)
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+        
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        try:
+            # Run OCR (use existing OCR parser if available, or simulate)
+            ocr_text = ""
+            conditions = []
+            allergens = []
+            
+            # Try to use existing OCR
+            try:
+                from ocr.parser import parse_medical_report
+                ocr_result = parse_medical_report(tmp_path)
+                ocr_text = ocr_result.get("raw_text", "")
+                conditions = ocr_result.get("conditions", [])
+                allergens = ocr_result.get("allergens", [])
+                vitals = ocr_result.get("vitals", {})  # Extract vitals!
+            except ImportError:
+                # Fallback: Extract basic info using simple text patterns
+                # In real app, integrate actual OCR library like Tesseract
+                
+                # For demo: simulate extraction based on common patterns
+                # This would be replaced with real OCR in production
+                ocr_text = f"Processed file: {file.filename}"
+                
+                # Simulate some extraction
+                conditions = ["general_checkup"]
+                allergens = []
+                vitals = {}
+            
+            # Update upload status
+            UploadRepository.update_status(upload_id, "completed")
+            
+            # Create medical profile with vitals in daily_targets
+            profile_id = str(uuid.uuid4())
+            MedicalProfileRepository.create(
+                profile_id=profile_id,
+                user_id=user["sub"],
+                conditions=conditions,
+                allergens=allergens,
+                daily_targets=vitals,  # Save vitals here!
+                raw_ocr_text=ocr_text,
+                source_file=file.filename,
+            )
+            
+            return {
+                "status": "success",
+                "upload_id": upload_id,
+                "profile": {
+                    "id": profile_id,
+                    "conditions": conditions,
+                    "allergens": allergens,
+                    "vitals": vitals,  # Return vitals in response
+                },
+                "message": "Medical profile created successfully",
+            }
+            
+        finally:
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+                
+    except HTTPException:
+        raise
+    except Exception as e:
+        UploadRepository.update_status(upload_id, "failed", str(e))
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+
+# =============================================================================
+# ROUTES: FOOD IMAGE UPLOAD
+# =============================================================================
+
+# Load food database from Indian_Continental_Nutrition_With_Dal_Variants.csv
+def _load_food_database():
+    """Load food database from CSV for nutrition lookups."""
+    import csv
+    food_db = {}
+    
+    # Try Indian food nutrition dataset first
+    csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "Indian_Continental_Nutrition_With_Dal_Variants.csv")
+    if not os.path.exists(csv_path):
+        csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "healthy_eating_dataset.csv")
+    
+    # Fallback defaults
+    food_db["default"] = {"calories": 200, "protein_g": 8, "carbs_g": 25, "fat_g": 8, "sugar_g": 5}
+    
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Support multiple formats
+                dish_name = row.get('Dish Name') or row.get('meal_name', '')
+                if dish_name:
+                    # Extract food type keywords for fallback matches
+                    keywords = ['pasta', 'rice', 'salad', 'soup', 'curry', 'dal', 'roti', 'paratha', 'dosa', 'idli', 'biryani', 'pulao', 'kheer', 'halwa', 'sandwich', 'chapati', 'paneer', 'samosa', 'pakora']
+                    for keyword in keywords:
+                        if keyword in dish_name.lower():
+                            if keyword not in food_db:
+                                food_db[keyword] = {
+                                    "calories": float(row.get('Calories (kcal)', 0) or row.get('calories', 0) or 0),
+                                    "protein_g": float(row.get('Protein (g)', 0) or row.get('protein_g', 0) or 0),
+                                    "carbs_g": float(row.get('Carbohydrates (g)', 0) or row.get('carbs_g', 0) or 0),
+                                    "fat_g": float(row.get('Fats (g)', 0) or row.get('fat_g', 0) or 0),
+                                    "sugar_g": float(row.get('Free Sugar (g)', 0) or row.get('sugar_g', 0) or 0),
+                                    "sodium_mg": float(row.get('Sodium (mg)', 0) or row.get('sodium_mg', 0) or 0),
+                                    "fiber_g": float(row.get('Fibre (g)', 0) or row.get('fiber_g', 0) or 0),
+                                    "density": float(row.get('Density (g/cm3)', 0) or row.get('density', 1.0) or 1.0),
+                                }
+                    
+                    # Also add full dish name for exact matches
+                    food_db[dish_name.lower()] = {
+                        "calories": float(row.get('Calories (kcal)', 0) or row.get('calories', 0) or 0),
+                        "protein_g": float(row.get('Protein (g)', 0) or row.get('protein_g', 0) or 0),
+                        "carbs_g": float(row.get('Carbohydrates (g)', 0) or row.get('carbs_g', 0) or 0),
+                        "fat_g": float(row.get('Fats (g)', 0) or row.get('fat_g', 0) or 0),
+                        "sugar_g": float(row.get('Free Sugar (g)', 0) or row.get('sugar_g', 0) or 0),
+                        "sodium_mg": float(row.get('Sodium (mg)', 0) or row.get('sodium_mg', 0) or 0),
+                        "fiber_g": float(row.get('Fibre (g)', 0) or row.get('fiber_g', 0) or 0),
+                        "density": float(row.get('Density (g/cm3)', 0) or row.get('density', 1.0) or 1.0),
+                    }
+        print(f"[FOOD DB] Loaded {len(food_db)} food entries from Indian_Continental_Nutrition_With_Dal_Variants.csv")
+    except Exception as e:
+        print(f"[FOOD DB] Warning: Could not load CSV, using defaults: {e}")
+        # Add fallback entries
+        food_db.update({
+            "apple": {"calories": 95, "protein_g": 0.5, "carbs_g": 25, "fat_g": 0.3, "sugar_g": 19},
+            "banana": {"calories": 105, "protein_g": 1.3, "carbs_g": 27, "fat_g": 0.4, "sugar_g": 14},
+            "pizza": {"calories": 285, "protein_g": 12, "carbs_g": 36, "fat_g": 10, "sugar_g": 4},
+        })
+    
+    return food_db
+
+FOOD_DATABASE = _load_food_database()
+
+
+@app.post("/api/food/upload")
+async def upload_food_image(
+    file: UploadFile = File(...),
+    user: dict = None,  # TEMP: Auth optional for testing
+):
+    """
+    Upload food image, run OCR, and return nutrition data.
+    
+    Flow:
+    1. Accept image
+    2. Run OCR to detect food/nutrition label
+    3. If nutrition found, use it
+    4. If not, detect food name and use USDA fallback
+    5. Apply medical safety rules
+    6. Return structured data
+    """
+    # Use demo user if no auth (matches meals endpoint)
+    if not user:
+        user = {"sub": "demo_user_123"}
+    
+    print(f"\n[FOOD UPLOAD] ====== Starting food image analysis ======")
+    print(f"[FOOD UPLOAD] User: {user.get('sub')}")
+    print(f"[FOOD UPLOAD] File: {file.filename} ({file.content_type})")
+    
+    # Validate file type
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image files are allowed")
+    
+    try:
+        content = await file.read()
+        
+        # Check file size
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+        
+        print(f"[FOOD UPLOAD] File size: {len(content) / 1024:.1f} KB")
+        
+        # Save temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        print(f"[FOOD UPLOAD] Saved to temp: {tmp_path}")
+        
+        try:
+            # Use food recognition service for image analysis
+            food_name = "Unknown Food"
+            nutrition = None
+            source = "estimated"
+            confidence = 0.5

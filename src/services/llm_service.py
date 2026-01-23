@@ -70,7 +70,11 @@ Given a meal and health conditions, suggest specific improvements. Important rul
 - Suggest ingredient substitutions and portion adjustments
 - Explain WHY each change helps
 - Never claim to treat or cure medical conditions
-- Keep responses structured with clear categories (Remove, Reduce, Replace)"""
+- Keep responses structured with clear categories (Remove, Reduce, Replace)""",
+
+        "clinical_nutritionist": """As a clinical dietitian, analyze the provided meal and offer practical, medical-aware advice. 
+Focus on 3 brief, extremely practical tips (e.g., 'replace white rice with brown', 'reduce salt').
+Be concise, professional, and use bullet points."""
     }
     
     def __init__(
@@ -83,10 +87,10 @@ Given a meal and health conditions, suggest specific improvements. Important rul
         
         Args:
             base_url: Ollama API base URL (defaults to OLLAMA_BASE_URL env var or http://localhost:11434)
-            model: Model to use (defaults to OLLAMA_MODEL env var or gemma:7b)
+            model: Model to use (defaults to OLLAMA_MODEL env var or gemma:2b)
         """
         self.base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.model = model or os.getenv("OLLAMA_MODEL", "gemma3:1b")
+        self.model = model or os.getenv("OLLAMA_MODEL", "gemma:2b")
         self._initialized = False
         
         # Test connection to Ollama
@@ -165,7 +169,7 @@ Given a meal and health conditions, suggest specific improvements. Important rul
                     ],
                     "stream": False
                 },
-                timeout=120  # Longer timeout for local inference
+                timeout=90  # 90s timeout for local inference
             )
             
             if response.status_code != 200:

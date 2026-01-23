@@ -56,7 +56,8 @@ class FeatureSelectionAnalyzer:
         "Calcium (mg)",
         "Iron (mg)",
         "Vitamin C (mg)",
-        "Folate (µg)"
+        "Folate (µg)",
+        "Density (g/cm3)"
     ]
     
     # Health condition thresholds for creating synthetic targets
@@ -93,7 +94,7 @@ class FeatureSelectionAnalyzer:
         if data_path is None:
             # Default path relative to project root
             base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            data_path = os.path.join(base_dir, "data", "Indian_Food_Nutrition_Processed.csv")
+            data_path = os.path.join(base_dir, "data", "Indian_Continental_Nutrition_With_Dal_Variants.csv")
         
         self.data_path = data_path
         self.data: List[Dict[str, Any]] = []

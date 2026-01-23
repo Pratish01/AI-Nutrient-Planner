@@ -28,6 +28,25 @@ import tempfile
 # Add src to path
 sys.path.insert(0, os.path.dirname(__file__))
 
+# =============================================================================
+# MANDATORY DEPENDENCY CHECK - HARD FAIL IF MISSING
+# =============================================================================
+# The stable food recognition pipeline REQUIRES SigLIP via HuggingFace Transformers.
+# If SigLIP is not available, the app MUST NOT start.
+# This prevents silent fallback to broken classification.
+
+try:
+    import transformers
+    print(f"[STARTUP] HuggingFace Transformers v{transformers.__version__} available - stable food recognition enabled")
+except ImportError as e:
+    print("[STARTUP] CRITICAL ERROR: HuggingFace Transformers is NOT installed!")
+    print("[STARTUP] The stable food recognition pipeline CANNOT run without SigLIP.")
+    print("[STARTUP] To fix: pip install transformers torch")
+    raise RuntimeError(
+        "HuggingFace Transformers is not installed. Stable food recognition pipeline cannot run. "
+        "Install with: pip install transformers torch"
+    ) from e
+
 from models.food import Food, NutritionInfo, FoodCategory
 from models.user import UserProfile, HealthCondition, DailyTargets, DailyIntake
 from rules.engine import RuleEngine
@@ -38,7 +57,11 @@ from auth.auth_service import auth_service
 from auth.database import MedicalProfileRepository, UploadRepository
 from services.llm_service import get_mistral_service, get_llm_service
 from services.rag_service import get_rag_service
-
+from services.llm_service import get_mistral_service, get_llm_service
+from services.rag_service import get_rag_service
+# Legacy pipeline removed
+from services.continental_retrieval import get_continental_retrieval_system
+from services.nutrition_registry import get_nutrition_registry
 
 # =============================================================================
 # APP SETUP
@@ -61,13 +84,30 @@ app.add_middleware(
 
 # Mount static files
 static_path = os.path.join(os.path.dirname(__file__), "..", "static")
-if os.path.exists(static_path):
-    app.mount("/static", StaticFiles(directory=static_path), name="static")
+app.mount("/static", StaticFiles(directory=static_path), name="static")
+
+@app.on_event("startup")
+async def startup_event():
+    """Foundational startup: database init and eager model loading."""
+    print("[STARTUP] Initializing database...")
+    from auth.database import init_database
+    init_database()
+    
+    print("[STARTUP] Warming up Continental Food Retrieval System (CLIP)...")
+    # Eager load the new CLIP retrieval system
+    continental_system = get_continental_retrieval_system()
+    print("[STARTUP] System READY!")
 
 
 # =============================================================================
-# GLOBAL STATE (In-memory for demo - use DB in production)
+# GLOBAL STATE & SERVICES
 # =============================================================================
+
+# Food Recognition & Nutrition
+# Food Recognition & Nutrition
+continental_system = get_continental_retrieval_system()
+nutrition_registry = get_nutrition_registry()
+nutrition_registry = get_nutrition_registry()
 
 # Default demo user
 demo_user = UserProfile(
@@ -162,6 +202,62 @@ async def get_optional_user(authorization: Optional[str] = Header(None)):
     payload = auth_service.verify_token(token)
     
     return payload  # Returns None if invalid
+
+
+def get_user_profile_for_rules(user_id: str = "demo_user_123") -> UserProfile:
+    """
+    Load user's medical profile from database and construct a UserProfile
+    object with proper HealthCondition enums for rule engine evaluation.
+    
+    This ensures the rule engine uses the user's ACTUAL conditions,
+    not hardcoded demo values.
+    """
+    # Try to get profile from database
+    db_profile = MedicalProfileRepository.get_by_user_id(user_id)
+    
+    if not db_profile:
+        # Fall back to demo user if no profile exists
+        return demo_user
+    
+    # Map condition strings to HealthCondition enums
+    conditions = []
+    for condition_str in db_profile.get("conditions", []):
+        condition_lower = condition_str.lower()
+        if "diabetes" in condition_lower:
+            conditions.append(HealthCondition.DIABETES)
+        elif "hypertension" in condition_lower or "blood pressure" in condition_lower:
+            conditions.append(HealthCondition.HYPERTENSION)
+        elif "obesity" in condition_lower or "overweight" in condition_lower:
+            conditions.append(HealthCondition.OBESITY)
+        # Log unknown conditions for debugging
+        else:
+            print(f"[RuleEngine] Unknown condition: {condition_str}")
+    
+    # Get allergens from database
+    allergens = db_profile.get("allergens", [])
+    
+    # Determine daily targets based on conditions
+    if HealthCondition.DIABETES in conditions:
+        targets = DailyTargets.for_diabetes()
+    elif HealthCondition.HYPERTENSION in conditions:
+        targets = DailyTargets.for_hypertension()
+    elif HealthCondition.OBESITY in conditions:
+        targets = DailyTargets.for_weight_loss()
+    else:
+        targets = DailyTargets()
+    
+    # Create UserProfile with actual conditions
+    user_profile = UserProfile(
+        user_id=user_id,
+        name=db_profile.get("name", "User"),
+        conditions=conditions,
+        allergens=allergens,
+        daily_targets=targets,
+    )
+    
+    print(f"[RuleEngine] Loaded profile for {user_id}: conditions={[c.value for c in conditions]}, allergens={allergens}")
+    
+    return user_profile
 
 
 # =============================================================================
@@ -319,10 +415,11 @@ async def chat(request: ChatRequest):
                 safety_level = "safe"
                 if food:
                     from rules.engine import RuleEngine
-                    rule_engine = RuleEngine()
-                    rule_violations = rule_engine.evaluate(food, demo_user)
+                    rule_engine_local = RuleEngine()
+                    user_profile = get_user_profile_for_rules(user_id)
+                    rule_violations = rule_engine_local.evaluate(food, user_profile)
                     violations = [v.to_dict() for v in rule_violations]
-                    verdict = rule_engine.get_final_verdict(rule_violations)
+                    verdict = rule_engine_local.get_final_verdict(rule_violations)
                     safety_level = verdict.value
                 
                 return ChatResponse(
@@ -547,11 +644,11 @@ CONDITION_THRESHOLDS = {
 }
 
 @app.post("/api/meal/fix")
-async def fix_meal(request: FixMealRequest, user: dict = None):
+async def fix_meal_endpoint(request: FixMealRequest, user: dict = Depends(get_optional_user)):
     """
     Clinical Nutrition AI - analyzes meal and suggests improvements.
-    Uses detected food data and user medical profile.
-    Does NOT ask for re-entry of data.
+    Uses detected food data, portion estimation, and user medical profile.
+    Provides actionable fix suggestions based on nutritional analysis.
     """
     if not user:
         user = {"sub": "demo_user_123"}
@@ -561,6 +658,7 @@ async def fix_meal(request: FixMealRequest, user: dict = None):
     # Get food data - from request or auto-fetch from context
     food_name = request.food_name
     nutrition = request.nutrition
+    portion_grams = 100  # Default portion size
     
     if not food_name or not nutrition:
         # Auto-fetch from current_food_context
@@ -568,6 +666,8 @@ async def fix_meal(request: FixMealRequest, user: dict = None):
             ctx = current_food_context[user_id]
             food_name = ctx.get("food_name", "Unknown Food")
             nutrition = ctx.get("nutrition", {})
+            # Try to get portion estimate if available
+            portion_grams = ctx.get("portion_grams", 100)
         else:
             return {
                 "verdict": "No Data",
@@ -576,219 +676,181 @@ async def fix_meal(request: FixMealRequest, user: dict = None):
                 "suggestions": {}
             }
     
-    # Get user medical profile
+    # Get user medical profile and conditions
     profile = MedicalProfileRepository.get_by_user_id(user_id)
     conditions = []
     if profile:
         conditions = profile.get("conditions", [])
     
-    # Analyze the meal
-    problems = []
-    remove_items = []
-    reduce_items = []
-    replace_items = []
-    improvements = {}
+    # Build detected items list for the meal fix service
+    detected_items = [{
+        "name": food_name,
+        "grams": portion_grams,
+        # Pass nutrition directly if we have it
+        "nutrition_override": nutrition
+    }]
     
-    # Extract nutrition values
+    # Use the new MealFixService for smart analysis
+    try:
+        from services.meal_fix_service import get_meal_fix_service
+        meal_fix = get_meal_fix_service()
+        
+        # Run analysis
+        result = meal_fix.analyze_meal(detected_items, conditions)
+        
+        if result.get("success"):
+            analysis = result.get("analysis", {})
+            suggestions = result.get("suggestions", [])
+            totals = analysis.get("totals", {})
+            
+            # Build formatted response with emoji template
+            if result.get("verdict") == "Healthy":
+                formatted_response = f"✅ This meal is suitable for your dietary needs.\n\n"
+                formatted_response += f"📊 Nutrition Summary:\n"
+                formatted_response += f"  • Calories: {totals.get('calories', 0):.0f} kcal\n"
+                formatted_response += f"  • Protein: {totals.get('protein_g', 0):.0f}g\n"
+                formatted_response += f"  • Carbs: {totals.get('carbs_g', 0):.0f}g\n"
+                formatted_response += f"  • Fat: {totals.get('fat_g', 0):.0f}g\n"
+            else:
+                formatted_response = f"⚠️ This meal needs some adjustments based on your health profile.\n\n"
+                
+                # List problems with icons
+                formatted_response += "❌ Issues Found:\n"
+                for s in suggestions:
+                    if s.get("type") == "warning":
+                        formatted_response += f"  {s.get('icon', '⚠️')} {s.get('title')}: {s.get('message')}\n"
+                
+                # List fixes
+                formatted_response += "\n💡 How to Fix:\n"
+                for s in suggestions:
+                    if s.get("fix"):
+                        formatted_response += f"  • {s.get('fix')}\n"
+                
+                # Nutrition summary
+                formatted_response += f"\n📊 Current Nutrition:\n"
+                formatted_response += f"  • Calories: {totals.get('calories', 0):.0f} kcal\n"
+                formatted_response += f"  • Protein: {totals.get('protein_g', 0):.0f}g\n"
+                formatted_response += f"  • Carbs: {totals.get('carbs_g', 0):.0f}g\n"
+                formatted_response += f"  • Sugar: {totals.get('sugar_g', 0):.0f}g\n"
+                formatted_response += f"  • Sodium: {totals.get('sodium_mg', 0):.0f}mg\n"
+            
+            # Try LLM enhancement if available
+            llm_suggestions = None
+            llm_service = get_llm_service()
+            
+            if llm_service.is_available and suggestions:
+                try:
+                    # Build simple context string instead of raw dict for model efficiency
+                    context_lines = [
+                        f"Current Meal: {food_name}",
+                        f"Health Profile: {', '.join(conditions) if conditions else 'No specific conditions'}"
+                    ]
+                    
+                    # Add current nutrition
+                    nut_str = f"Calories: {totals.get('calories',0)}, Protein: {totals.get('protein_g',0)}g, Sugar: {totals.get('sugar_g',0)}g"
+                    context_lines.append(f"Nutrition: {nut_str}")
+                    
+                    # Detailed issues list
+                    issues_str = "\n".join([
+                        f"- {s.get('title')}: {s.get('message')}"
+                        for s in suggestions if s.get("type") == "warning"
+                    ])
+                    
+                    fix_prompt = f"""Analyze this meal and provide 3 quick, practical fixes.
+                    
+MEAL INFO: {food_name}
+ISSUES:
+{issues_str}
+
+USER CONDITIONS: {', '.join(conditions) if conditions else 'None'}"""
+                    
+                    llm_response = llm_service.chat(
+                        prompt=fix_prompt,
+                        system_prompt="clinical_nutritionist",
+                        rag_context="\n".join(context_lines)
+                    )
+                    if llm_response.success:
+                        llm_suggestions = llm_response.content
+                        formatted_response += f"\n\n🤖 AI Dietitian's Advice:\n{llm_suggestions}"
+                except Exception as e:
+                    print(f"[MEAL FIX] LLM enhancement error: {e}")
+            
+            return {
+                "verdict": result.get("verdict"),
+                "message": result.get("message"),
+                "formatted_response": formatted_response,
+                "food_name": food_name,
+                "portion_grams": portion_grams,
+                "nutrition": totals,
+                "targets": result.get("targets", {}),
+                "problems": [
+                    {
+                        "category": s.get("category"),
+                        "title": s.get("title"),
+                        "message": s.get("message")
+                    }
+                    for s in suggestions if s.get("type") == "warning"
+                ],
+                "suggestions": [
+                    {
+                        "category": s.get("category"),
+                        "fix": s.get("fix")
+                    }
+                    for s in suggestions if s.get("fix")
+                ],
+                "conditions_checked": conditions
+            }
+            
+    except ImportError as ie:
+        print(f"[MEAL FIX] MealFixService import error: {ie}")
+    except Exception as e:
+        print(f"[MEAL FIX] Analysis error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Fallback to basic analysis if MealFixService fails
+    print(f"[MEAL FIX] Running basic fallback analysis for {food_name}")
     calories = nutrition.get("calories", 0)
     carbs = nutrition.get("carbs_g", 0)
     sugar = nutrition.get("sugar_g", 0)
-    fat = nutrition.get("fat_g", 0)
     sodium = nutrition.get("sodium_mg", 0)
     protein = nutrition.get("protein_g", 0)
-    fiber = nutrition.get("fiber_g", 0)
     
-    # Check against conditions
-    for condition in conditions:
-        condition_lower = condition.lower()
-        
-        # Diabetes checks
-        if "diabetes" in condition_lower:
-            if sugar > 10:
-                problems.append({
-                    "ingredient": food_name,
-                    "reason": f"High sugar ({sugar}g) can cause glucose spikes",
-                    "condition": "Diabetes"
-                })
-                reduce_items.append(f"Sugar content by {sugar - 10}g")
-                improvements["sugar_reduction"] = f"-{sugar - 10}g sugar"
-            if carbs > 45:
-                problems.append({
-                    "ingredient": food_name,
-                    "reason": f"High carbohydrates ({carbs}g) affects blood sugar",
-                    "condition": "Diabetes"
-                })
-        
-        # Hypertension checks
-        if "hypertension" in condition_lower or "blood pressure" in condition_lower:
-            if sodium > 500:
-                problems.append({
-                    "ingredient": food_name,
-                    "reason": f"High sodium ({sodium}mg) raises blood pressure",
-                    "condition": "Hypertension"
-                })
-                reduce_items.append(f"Sodium by {sodium - 500}mg")
-                replace_items.append("Use herbs/spices instead of salt")
-                improvements["sodium_reduction"] = f"-{sodium - 500}mg sodium"
-        
-        # Cholesterol checks
-        if "cholesterol" in condition_lower:
-            if fat > 15:
-                problems.append({
-                    "ingredient": food_name,
-                    "reason": f"High fat content ({fat}g) affects cholesterol levels",
-                    "condition": "High Cholesterol"
-                })
-                replace_items.append("Choose lean proteins or grilled options")
-                improvements["fat_reduction"] = f"-{fat - 15}g fat"
-        
-        # Kidney disease checks
-        if "kidney" in condition_lower:
-            if sodium > 400:
-                problems.append({
-                    "ingredient": food_name,
-                    "reason": f"High sodium ({sodium}mg) strains kidneys",
-                    "condition": "Kidney Disease"
-                })
-            if protein > 25:
-                problems.append({
-                    "ingredient": food_name,
-                    "reason": f"High protein ({protein}g) may strain kidney function",
-                    "condition": "Kidney Disease"
-                })
+    problems = []
+    suggestions_list = []
     
-    # General health checks (for users without specific conditions)
-    if not conditions or len(problems) == 0:
-        if calories > 600:
-            problems.append({
-                "ingredient": food_name,
-                "reason": f"High calorie meal ({calories} cal) - consider portion control",
-                "condition": "General Health"
-            })
-            improvements["calorie_reduction"] = "Consider smaller portion"
-        
-        if sugar > 25:
-            problems.append({
-                "ingredient": food_name,
-                "reason": f"High sugar content ({sugar}g) - exceeds recommended limits",
-                "condition": "General Health"
-            })
-            replace_items.append("Choose unsweetened alternatives")
-        
-        if sodium > 800:
-            problems.append({
-                "ingredient": food_name,
-                "reason": f"High sodium ({sodium}mg) - may affect blood pressure over time",
-                "condition": "General Health"
-            })
+    # Basic checks
+    if sugar > 15:
+        problems.append({"title": "High Sugar", "message": f"Sugar content is {sugar}g (limit: 15g)"})
+        suggestions_list.append({"category": "sugar", "fix": "Choose unsweetened alternatives or non-starchy vegetables."})
+    if sodium > 600:
+        problems.append({"title": "High Sodium", "message": f"Sodium is {sodium}mg (limit: 600mg)"})
+        suggestions_list.append({"category": "sodium", "fix": "Use herbs and spices instead of salt. Avoid processed toppings."})
+    if protein < 15:
+        problems.append({"title": "Low Protein", "message": f"Only {protein}g protein (need 15-25g)"})
+        suggestions_list.append({"category": "protein", "fix": "Add a protein source like eggs, paneer, dal, or lean meat."})
     
-    # Determine verdict
-    if len(problems) == 0:
-        verdict = "Healthy"
-        message = f"{food_name} appears suitable for your dietary needs."
-        formatted_response = f"✅ This meal is suitable for your dietary needs.\n\nNo problematic ingredients detected for your conditions."
-        llm_suggestions = None
+    verdict = "Healthy" if not problems else "Needs Fix"
+    
+    # Build a more descriptive formatted response for the fallback
+    if verdict == "Healthy":
+        formatted_response = f"✅ Your meal '{food_name}' looks well-balanced."
     else:
-        verdict = "Needs Fix"
-        message = f"{food_name} has {len(problems)} issue(s) based on your health profile."
-        
-        # Try LLM-powered suggestions first with RAG context
-        llm_suggestions = None
-        llm_service = get_llm_service()
-        rag_service = get_rag_service()
-        
-        if llm_service.is_available:
-            # Build RAG context for personalized suggestions
-            rag_context = rag_service.build_context(
-                user_id=user_id,
-                meal_logs=user_meal_logs,
-                current_food=nutrition,
-                user_question="How can I make this meal healthier?"
-            )
-            
-            # Build detailed prompt for meal fixing
-            problems_str = "\n".join(
-                f"- {p.get('ingredient', 'Unknown')}: {p.get('reason', 'Unknown')} ({p.get('condition', '')})"
-                for p in problems
-            )
-            
-            fix_prompt = f"""Based on the user's health profile and the meal analysis, provide specific suggestions to fix this meal.
-
-DETECTED PROBLEMS:
-{problems_str}
-
-Provide actionable suggestions in these categories:
-1. REMOVE: Items to remove entirely
-2. REDUCE: Items to reduce quantity
-3. REPLACE: Healthier alternatives
-4. ADD: Beneficial additions
-
-Be specific and practical for someone with these health conditions."""
-            
-            llm_response = llm_service.chat(
-                prompt=fix_prompt,
-                system_prompt="meal_fixer",
-                rag_context=rag_context
-            )
-            if llm_response.success:
-                llm_suggestions = llm_response.content
-        
-        # Build formatted response with emoji template
-        formatted_response = f"This meal is NOT suitable based on your health profile.\n\n"
-        
-        # Problematic items
-        formatted_response += "❌ Problematic items:\n"
+        formatted_response = f"⚠️ Issues found in your meal '{food_name}':\n\n"
         for p in problems:
-            formatted_response += f"  • {p['ingredient']} - {p['reason']} ({p['condition']})\n"
-        
-        # Use LLM suggestions if available, otherwise fallback to rule-based
-        if llm_suggestions:
-            formatted_response += f"\n🤖 AI-Powered Suggestions:\n{llm_suggestions}\n"
-        else:
-            # Fallback to rule-based suggestions
-            # Fix suggestions
-            formatted_response += "\n🔧 Fix suggestions:\n"
-            if remove_items:
-                formatted_response += "  REMOVE:\n"
-                for item in remove_items:
-                    formatted_response += f"    • {item}\n"
-            if reduce_items:
-                formatted_response += "  REDUCE:\n"
-                for item in reduce_items:
-                    formatted_response += f"    • {item}\n"
-            if replace_items:
-                formatted_response += "  REPLACE:\n"
-                for item in replace_items:
-                    formatted_response += f"    • {item}\n"
-            
-            # Healthier alternatives
-            formatted_response += "\n✅ Healthier alternatives:\n"
-            if "diabetes" in str(conditions).lower() and sugar > 10:
-                formatted_response += "  • Choose whole fruits instead of sugary items\n"
-                formatted_response += "  • Use stevia or monk fruit as sweetener\n"
-            if "hypertension" in str(conditions).lower() and sodium > 500:
-                formatted_response += "  • Use herbs, garlic, or lemon for flavor\n"
-                formatted_response += "  • Choose fresh food over processed\n"
-            if "cholesterol" in str(conditions).lower() and fat > 15:
-                formatted_response += "  • Choose grilled or baked instead of fried\n"
-                formatted_response += "  • Use olive oil instead of butter\n"
-            if not any(k in str(conditions).lower() for k in ["diabetes", "hypertension", "cholesterol"]):
-                formatted_response += "  • Choose smaller portion sizes\n"
-                formatted_response += "  • Add more vegetables to balance the meal\n"
+            formatted_response += f"• **{p['title']}**: {p['message']}\n"
+        formatted_response += "\n💡 Quick Fix:\n"
+        for s in suggestions_list:
+            formatted_response += f"• {s['fix']}\n"
     
     return {
         "verdict": verdict,
-        "message": message,
+        "message": f"Analyzed {food_name}" + (f" with {len(problems)} issues" if problems else ""),
         "formatted_response": formatted_response,
         "food_name": food_name,
         "nutrition": nutrition,
         "problems": problems,
-        "suggestions": {
-            "remove": remove_items,
-            "reduce": reduce_items,
-            "replace_with": replace_items
-        },
-        "expected_improvements": improvements,
+        "suggestions": suggestions_list,
         "conditions_checked": conditions
     }
 
@@ -886,6 +948,9 @@ async def analyze_food(food: FoodInput):
     if carbs_g < food.sugar_g + food.fiber_g:
         carbs_g = food.sugar_g + food.fiber_g
     
+    # Load user's actual profile for rule evaluation
+    user_profile = get_user_profile_for_rules("demo_user_123")
+    
     food_obj = Food(
         food_id=f"analyze-{datetime.now().timestamp()}",
         name=food.name,
@@ -903,7 +968,7 @@ async def analyze_food(food: FoodInput):
         allergens=[],
     )
     
-    violations = rule_engine.evaluate(food_obj, demo_user)
+    violations = rule_engine.evaluate(food_obj, user_profile)
     verdict = rule_engine.get_final_verdict(violations)
     
     return {
@@ -1173,6 +1238,24 @@ async def get_current_user_info(user: dict = Depends(get_current_user)):
     return user_data
 
 
+@app.post("/auth/logout")
+async def logout(user: dict = Depends(get_current_user)):
+    """
+    Logout the current user.
+    
+    For JWT-based auth, the actual token invalidation happens client-side
+    by removing the token from storage. This endpoint:
+    1. Confirms the user was authenticated
+    2. Can be extended to add token to a blacklist if needed
+    3. Provides a clean API contract for frontend logout flows
+    """
+    return {
+        "success": True,
+        "message": "Logged out successfully",
+        "user_id": user["sub"]
+    }
+
+
 # =============================================================================
 # ROUTES: PROFILE (Authenticated)
 # =============================================================================
@@ -1297,14 +1380,14 @@ async def upload_medical_report_legacy(
 # ROUTES: FOOD IMAGE UPLOAD
 # =============================================================================
 
-# Load food database from Indian_Food_Nutrition_Processed.csv
+# Load food database from Indian_Continental_Nutrition_With_Dal_Variants.csv
 def _load_food_database():
     """Load food database from CSV for nutrition lookups."""
     import csv
     food_db = {}
     
     # Try Indian food nutrition dataset first
-    csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "Indian_Food_Nutrition_Processed.csv")
+    csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "Indian_Continental_Nutrition_With_Dal_Variants.csv")
     if not os.path.exists(csv_path):
         csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "healthy_eating_dataset.csv")
     
@@ -1331,6 +1414,7 @@ def _load_food_database():
                                     "sugar_g": float(row.get('Free Sugar (g)', 0) or row.get('sugar_g', 0) or 0),
                                     "sodium_mg": float(row.get('Sodium (mg)', 0) or row.get('sodium_mg', 0) or 0),
                                     "fiber_g": float(row.get('Fibre (g)', 0) or row.get('fiber_g', 0) or 0),
+                                    "density": float(row.get('Density (g/cm3)', 0) or row.get('density', 1.0) or 1.0),
                                 }
                     
                     # Also add full dish name for exact matches
@@ -1342,8 +1426,9 @@ def _load_food_database():
                         "sugar_g": float(row.get('Free Sugar (g)', 0) or row.get('sugar_g', 0) or 0),
                         "sodium_mg": float(row.get('Sodium (mg)', 0) or row.get('sodium_mg', 0) or 0),
                         "fiber_g": float(row.get('Fibre (g)', 0) or row.get('fiber_g', 0) or 0),
+                        "density": float(row.get('Density (g/cm3)', 0) or row.get('density', 1.0) or 1.0),
                     }
-        print(f"[FOOD DB] Loaded {len(food_db)} food entries from Indian_Food_Nutrition_Processed.csv")
+        print(f"[FOOD DB] Loaded {len(food_db)} food entries from Indian_Continental_Nutrition_With_Dal_Variants.csv")
     except Exception as e:
         print(f"[FOOD DB] Warning: Could not load CSV, using defaults: {e}")
         # Add fallback entries
@@ -1409,177 +1494,65 @@ async def upload_food_image(
             source = "estimated"
             confidence = 0.5
             
-            print(f"[FOOD UPLOAD] Calling food recognition pipeline...")
             
-            # STEP 1: Try YOLO food recognition first
+            
+            # =========================================================================
+            # =========================================================================
+            # CONTINENTAL RETRIEVAL SYSTEM (CLIP)
+            # =========================================================================
             try:
-                from services.yolo_service import get_yolo_recognizer
-                yolo = get_yolo_recognizer()
+                print(f"[FOOD UPLOAD] Calling CONTINENTAL retrieval pipeline...")
                 
-                if yolo.is_available:
-                    print(f"[FOOD UPLOAD] Using YOLO model for recognition...")
-                    yolo_result = yolo.predict(tmp_path)
+                # Run retrieval (Top-5)
+                # Note: main_inference handles PIL conversion and logic internally
+                retrieval_result = continental_system.main_inference(tmp_path, k=5)
+                
+                # 1. RESOLUTION HIERARCHY: Specific Dish -> Food Group -> Unknown
+                # Start with best match
+                top_match = retrieval_result["top_k_predictions"][0]
+                final_food_name = top_match["dish"]
+                final_confidence = top_match["score"]
+                
+                print(f"[FOOD UPLOAD] ✓ Top Match: {final_food_name} ({final_confidence:.3f})")
+                
+                # Get nutrition if available
+                from services.nutrition_registry import get_nutrition_registry
+                nutrition_registry = get_nutrition_registry()
+                
+                nutrition = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "sugar_g": 0, "fiber_g": 0, "sodium_mg": 0}
+                if nutrition_registry:
+                    lookup = nutrition_registry.get_by_name(final_food_name)
+                    if lookup:
+                        nutrition = lookup
+                        print(f"[FOOD UPLOAD] ✓ Nutrition found for {final_food_name}")
+
+                # Build final response
+                return {
+                    "status": "success",
+                    "food_name": final_food_name,
+                    "confidence": final_confidence,
+                    "resolution_type": "retrieval",
+                    "safety_verdict": "safe", 
+                    "nutrition": {
+                        "calories": float(nutrition.get("calories", 0)),
+                        "protein_g": float(nutrition.get("protein_g", 0)),
+                        "carbs_g": float(nutrition.get("carbs_g", 0)),
+                        "fat_g": float(nutrition.get("fat_g", 0)),
+                        "sugar_g": float(nutrition.get("sugar_g", 0)),
+                        "fiber_g": float(nutrition.get("fiber_g", 0)),
+                        "sodium_mg": float(nutrition.get("sodium_mg", 0)),
+                    },
+                    "meta": {
+                        "top_k": retrieval_result["top_k_predictions"]
+                    }
+                }
                     
-                    if yolo_result.get("success") and yolo_result.get("food_name"):
-                        food_name = yolo_result["food_name"]
-                        confidence = yolo_result.get("confidence", 0.8)
-                        source = "yolo_model"
-                        print(f"[FOOD UPLOAD] ✓ YOLO detected: {food_name} ({confidence:.0%})")
-                        
-                        # Look up nutrition data for detected food
-                        for db_food, data in FOOD_DATABASE.items():
-                            if db_food.lower() in food_name.lower() or food_name.lower() in db_food.lower():
-                                nutrition = data.copy()
-                                print(f"[FOOD UPLOAD] ✓ Found nutrition for: {db_food}")
-                                break
-                    else:
-                        print(f"[FOOD UPLOAD] YOLO: No food detected, trying OCR...")
-                else:
-                    print(f"[FOOD UPLOAD] YOLO model not available, trying OCR...")
-            except ImportError as ie:
-                print(f"[FOOD UPLOAD] YOLO import error (install ultralytics): {ie}")
             except Exception as e:
-                print(f"[FOOD UPLOAD] YOLO error: {e}")
-            
-            # STEP 2: Try OCR if YOLO didn't find nutrition
-            if not nutrition:
-                try:
-                    from ocr.food_recognition import parse_nutrition_label
-                    ocr_result = parse_nutrition_label(tmp_path)
-                    print(f"[FOOD UPLOAD] OCR result: {ocr_result}")
-                    
-                    if ocr_result and ocr_result.get("nutrition"):
-                        nutrition = ocr_result["nutrition"]
-                        food_name = ocr_result.get("food_name", food_name)
-                        source = ocr_result.get("source", "database")
-                        confidence = ocr_result.get("confidence", 0.7)
-                        print(f"[FOOD UPLOAD] ✓ OCR recognized: {food_name} via {source} ({confidence:.0%})")
-                    else:
-                        print(f"[FOOD UPLOAD] ✗ No nutrition data from OCR")
-                except Exception as e:
-                    print(f"[FOOD UPLOAD] ✗ OCR error: {e}")
-            
-            # Fallback: detect food from filename or use default
-            if not nutrition:
-                # Try to match food name from filename
-                filename_lower = file.filename.lower() if file.filename else ""
-                for food, data in FOOD_DATABASE.items():
-                    if food in filename_lower:
-                        food_name = food.title()
-                        nutrition = data.copy()
-                        source = "usda_fallback"
-                        confidence = 0.6
-                        break
-                
-                # Default if nothing matched
-                if not nutrition:
-                    food_name = "Mixed Meal"
-                    nutrition = FOOD_DATABASE["default"].copy()
-                    source = "estimated"
-                    confidence = 0.3
-            
-            # Create Food object for rule checking
-            # Ensure we handle None values properly
-            cal = float(nutrition.get("calories") or 0)
-            prot = float(nutrition.get("protein_g") or 0)
-            carb = float(nutrition.get("carbs_g") or 0)
-            fat = float(nutrition.get("fat_g") or 0)
-            sugar = float(nutrition.get("sugar_g") or 0)
-            fiber = float(nutrition.get("fiber_g") or 0)
-            sodium = float(nutrition.get("sodium_mg") or 0)
-            
-            # Ensure carbs >= sugar + fiber for validation
-            if carb < sugar + fiber:
-                carb = sugar + fiber
-            
-            nutrition_info = NutritionInfo(
-                calories=cal,
-                protein_g=prot,
-                carbs_g=carb,
-                fat_g=fat,
-                sugar_g=sugar,
-                fiber_g=fiber,
-                sodium_mg=sodium,
-            )
-            
-            food = Food(
-                food_id=str(uuid.uuid4()),
-                name=food_name,
-                nutrition=nutrition_info,
-                serving_size=100.0,
-                serving_unit="g",
-            )
-            
-            # Apply safety rules
-            violations = rule_engine.evaluate(food, demo_user)
-            final_verdict = rule_engine.get_final_verdict(violations)
-            
-            # Determine verdict
-            verdict = "safe"
-            if final_verdict.value == "block":
-                verdict = "danger"
-            elif final_verdict.value in ["warn", "alert"]:
-                verdict = "warning"
-            
-            # Store the meal in user's log BEFORE returning
-            user_id = user["sub"]
-            if user_id not in user_meal_logs:
-                user_meal_logs[user_id] = []
-            
-            meal_data = {
-                "food_name": food_name,
-                "nutrition": {
-                    "calories": cal,
-                    "protein_g": prot,
-                    "carbs_g": carb,
-                    "fat_g": fat,
-                    "sugar_g": sugar,
-                    "fiber_g": fiber,
-                    "sodium_mg": sodium,
-                },
-                "timestamp": datetime.now().isoformat(),
-                "source": source,
-                "confidence": confidence,
-            }
-            
-            user_meal_logs[user_id].append(meal_data)
-            
-            # Set as current food context for immediate AI coach use
-            current_food_context[user_id] = meal_data
-            
-            print(f"[FOOD UPLOAD] ✓ Stored meal in logs (total: {len(user_meal_logs[user_id])})")
-            print(f"[FOOD UPLOAD] ✓ Set as current context for AI coach")
-            
-            # Now return the response
-            response_data = {
-                "status": "success",
-                "food_name": food_name,
-                "confidence": confidence,
-                "nutrition": {
-                    "calories": nutrition_info.calories,
-                    "protein_g": nutrition_info.protein_g,
-                    "carbs_g": nutrition_info.carbs_g,
-                    "fat_g": nutrition_info.fat_g,
-                    "sugar_g": nutrition_info.sugar_g,
-                    "fiber_g": nutrition_info.fiber_g,
-                    "sodium_mg": nutrition_info.sodium_mg,
-                },
-                "safety": {
-                    "verdict": verdict,
-                    "level": final_verdict.value,
-                    "violations": [
-                        {
-                            "rule_id": v.rule_id,
-                            "severity": v.severity.value,
-                            "message": v.message,
-                        }
-                        for v in violations
-                    ],
-                },
-                "source": source,
-            }
-            
-            return response_data
+                print(f"[FOOD UPLOAD] ERROR: Retrieval failed: {e}")
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(status_code=500, detail=f"Recognition failed: {str(e)}")
+
             
         finally:
             if os.path.exists(tmp_path):
@@ -1744,72 +1717,7 @@ async def generate_recipe(
     }
 
 
-# =============================================================================
-# ROUTES: FIX MY MEAL
-# =============================================================================
-
-class FixMealRequest(BaseModel):
-    food_name: str
-    nutrition: Dict[str, float]
-    violations: Optional[List[str]] = None
-
-
-@app.post("/api/meal/fix")
-async def fix_meal(
-    request: FixMealRequest,
-    user: dict = Depends(get_current_user),
-):
-    """
-    Suggest fixes for a meal with violations.
-    """
-    suggestions = []
-    
-    # Analyze and suggest fixes based on common issues
-    if request.nutrition.get("sugar_g", 0) > 20:
-        suggestions.append({
-            "issue": "High sugar content",
-            "fix": "Replace with sugar-free alternative or reduce portion by half",
-            "impact": f"Reduce sugar from {request.nutrition.get('sugar_g', 0)}g to ~{request.nutrition.get('sugar_g', 0)/2}g"
-        })
-    
-    if request.nutrition.get("sodium_mg", 0) > 500:
-        suggestions.append({
-            "issue": "High sodium",
-            "fix": "Use low-sodium version or add potassium-rich sides (banana, spinach)",
-            "impact": f"Balance sodium with potassium"
-        })
-    
-    if request.nutrition.get("fat_g", 0) > 20:
-        suggestions.append({
-            "issue": "High fat content", 
-            "fix": "Choose grilled instead of fried, or trim visible fat",
-            "impact": f"Reduce fat from {request.nutrition.get('fat_g', 0)}g to ~{request.nutrition.get('fat_g', 0)*0.6}g"
-        })
-    
-    if request.nutrition.get("calories", 0) > 500:
-        suggestions.append({
-            "issue": "High calorie meal",
-            "fix": "Reduce portion size or add more vegetables to feel full",
-            "impact": f"Reduce calories by 30%"
-        })
-    
-    if not suggestions:
-        suggestions.append({
-            "issue": "No major issues",
-            "fix": "This meal looks reasonable! Consider adding more fiber.",
-            "impact": "Improved digestion"
-        })
-    
-    return {
-        "status": "success",
-        "original_food": request.food_name,
-        "suggestions": suggestions,
-        "fixed_meal": {
-            "name": f"Healthier {request.food_name}",
-            "estimated_reduction": "~30% fewer calories/sugar/sodium"
-        }
-    }
-
+# (Duplicate /api/meal/fix removed - the correct endpoint is defined above in the ROUTES: FIX MEAL section)
 
 # =============================================================================
 # ROUTES: ANALYTICS

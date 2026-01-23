@@ -218,8 +218,13 @@ class UserProfile:
     @classmethod
     def from_dict(cls, data: dict) -> "UserProfile":
         """Create UserProfile from dictionary."""
-        conditions = [HealthCondition(c) for c in data.get("conditions", [])]
-        
+        conditions = []
+        for c in data.get("conditions", []):
+            try:
+                conditions.append(HealthCondition(c))
+            except ValueError:
+                print(f"[UserProfile] WARNING: Unknown condition encountered: '{c}'. Ignoring.")
+
         # Set appropriate daily targets based on conditions
         if HealthCondition.DIABETES in conditions:
             targets = DailyTargets.for_diabetes()

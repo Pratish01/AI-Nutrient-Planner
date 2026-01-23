@@ -292,9 +292,9 @@ Features:
     },
     
     "Data (data/)": {
-        "Indian_Food_Nutrition_Processed.csv": {
+        "Indian_Continental_Nutrition_With_Dal_Variants.csv": {
             "purpose": "Nutrition Database",
-            "description": """Indian food nutrition dataset with 1016 food items.
+            "description": """Indian and Continental food nutrition dataset with 1182 food items including dal variants.
             
 Columns:
 - Dish Name
@@ -308,7 +308,8 @@ Columns:
 - Calcium (mg)
 - Iron (mg)
 - Vitamin C (mg)
-- Folate (µg)"""
+- Folate (µg)
+- Density (g/cm3) - for volume-to-weight conversion"""
         }
     }
 }
