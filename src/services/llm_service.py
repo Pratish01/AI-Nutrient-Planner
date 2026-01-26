@@ -74,7 +74,26 @@ Given a meal and health conditions, suggest specific improvements. Important rul
 
         "clinical_nutritionist": """As a clinical dietitian, analyze the provided meal and offer practical, medical-aware advice. 
 Focus on 3 brief, extremely practical tips (e.g., 'replace white rice with brown', 'reduce salt').
-Be concise, professional, and use bullet points."""
+Be concise, professional, and use bullet points.""",
+        
+        "recipe_creator": """You are an expert healthy chef and nutritionist. 
+Generate a healthy recipe based on provided ingredients and user health profile.
+
+IMPORTANT: YOUR RESPONSE MUST BE ONLY A RAW JSON OBJECT. 
+NO MARKDOWN BOXES. NO INTRO TEXT. NO EXPLANATIONS.
+
+SCHEMA:
+{
+  "name": "Recipe Name",
+  "ingredients": ["item 1", "item 2"],
+  "instructions": ["Step 1", "Step 2"],
+  "nutrition": {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0},
+  "health_note": "How this helps the user's conditions"
+}
+
+Rules:
+- Respect all health conditions and allergens.
+- Use simple, accessible ingredients."""
     }
     
     def __init__(
@@ -293,6 +312,32 @@ Format your response with:
 Be specific and practical."""
         
         return self.chat(prompt, system_prompt="meal_fixer", context=context)
+
+    def generate_recipe(
+        self,
+        ingredients: List[str],
+        user_profile: Dict[str, Any]
+    ) -> LLMResponse:
+        """
+        Generate a healthy recipe from a list of ingredients.
+        
+        Args:
+            ingredients: List of ingredient names
+            user_profile: User's health profile (conditions, allergens)
+            
+        Returns:
+            LLMResponse with the generated recipe.
+        """
+        context = {
+            "Ingredients available": ", ".join(ingredients),
+            "Health Conditions": ", ".join(user_profile.get("conditions", [])),
+            "Allergens to avoid": ", ".join(user_profile.get("allergens", []))
+        }
+        
+        prompt = f"Create a healthy recipe using these ingredients: {', '.join(ingredients)}. "
+        prompt += "Ensure it is safe given the user's health profile."
+        
+        return self.chat(prompt, system_prompt="recipe_creator", context=context)
 
 
 # Global singleton instance

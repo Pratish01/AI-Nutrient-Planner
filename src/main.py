@@ -1393,7 +1393,9 @@ def _load_food_database():
     food_db = {}
     
     # Try Indian food nutrition dataset first
-    csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "Indian_Continental_Nutrition_With_Dal_Variants.csv")
+    csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "FINAL_ACCURATE_FOOD_DATASET_WITH_CUISINE (1).csv")
+    if not os.path.exists(csv_path):
+        csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "Indian_Continental_Nutrition_With_Dal_Variants.csv")
     if not os.path.exists(csv_path):
         csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "healthy_eating_dataset.csv")
     
@@ -1434,7 +1436,7 @@ def _load_food_database():
                         "fiber_g": float(row.get('Fibre (g)', 0) or row.get('fiber_g', 0) or 0),
                         "density": float(row.get('Density (g/cm3)', 0) or row.get('density', 1.0) or 1.0),
                     }
-        print(f"[FOOD DB] Loaded {len(food_db)} food entries from Indian_Continental_Nutrition_With_Dal_Variants.csv")
+        print(f"[FOOD DB] Loaded {len(food_db)} food entries from {os.path.basename(csv_path)}")
     except Exception as e:
         print(f"[FOOD DB] Warning: Could not load CSV, using defaults: {e}")
         # Add fallback entries
@@ -1524,15 +1526,31 @@ async def upload_food_image(
                 print(f"[FOOD UPLOAD] ✓ Top Match: {final_food_name} ({final_confidence:.3f})")
                 
                 # Get nutrition if available
-                from services.nutrition_registry import get_nutrition_registry
-                nutrition_registry = get_nutrition_registry()
+                # 1. Try exact match in local CSV database
+                lookup = FOOD_DATABASE.get(final_food_name.lower())
                 
+                # 2. Try registry (fuzzy matching) if local lookup failed
+                if not lookup:
+                    from services.nutrition_registry import get_nutrition_registry
+                    nutrition_registry = get_nutrition_registry()
+                    if nutrition_registry:
+                        lookup = nutrition_registry.get_by_name(final_food_name)
+                
+                # 3. Keyword fallback if still no lookup
+                if not lookup:
+                    keywords = ['dal', 'curry', 'roti', 'paratha', 'rice', 'sandwich', 'pasta', 'salad']
+                    for kw in keywords:
+                        if kw in final_food_name.lower() and kw in FOOD_DATABASE:
+                            lookup = FOOD_DATABASE[kw]
+                            print(f"[FOOD UPLOAD] ⚠ Falling back to keyword match: {kw}")
+                            break
+
                 nutrition = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "sugar_g": 0, "fiber_g": 0, "sodium_mg": 0}
-                if nutrition_registry:
-                    lookup = nutrition_registry.get_by_name(final_food_name)
-                    if lookup:
-                        nutrition = lookup
-                        print(f"[FOOD UPLOAD] ✓ Nutrition found for {final_food_name}")
+                if lookup:
+                    nutrition = lookup
+                    print(f"[FOOD UPLOAD] ✓ Nutrition found for {final_food_name}")
+                else:
+                    print(f"[FOOD UPLOAD] ❌ No nutrition found for {final_food_name}")
 
                 # Build final response
                 
@@ -1726,7 +1744,73 @@ async def generate_recipe(
                 total_nutrition["fat_g"] += data.get("fat_g", 0)
                 break
     
-    # Generate simple recipe
+    # Fetch medical profile via RAG for personalization
+    rag_service = get_rag_service()
+    profile = rag_service.get_medical_profile(user.get("sub", "demo_user_123"))
+    
+    # Try AI-powered generation first
+    llm_service = get_llm_service()
+    if llm_service.is_available:
+        print(f"[RECIPE] Generating AI recipe for ingredients: {request.ingredients}")
+        llm_response = llm_service.generate_recipe(request.ingredients, profile)
+        
+        if llm_response.success:
+            try:
+                import json
+                import re
+                
+                content = llm_response.content.strip()
+                
+                # 1. Try finding JSON in code blocks
+                json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+                if json_match:
+                    content = json_match.group(1).strip()
+                else:
+                    # 2. Try finding the first { and last }
+                    start = content.find('{')
+                    end = content.rfind('}')
+                    if start != -1 and end != -1:
+                        content = content[start:end+1].strip()
+                
+                recipe_data = json.loads(content)
+                print(f"[RECIPE] Successfully parsed AI JSON recipe: {recipe_data.get('name')}")
+                
+                # Ensure ingredients and instructions are lists for the frontend
+                ingredients = recipe_data.get("ingredients", request.ingredients)
+                if isinstance(ingredients, str): ingredients = [ingredients]
+                
+                instructions = recipe_data.get("instructions", [])
+                if isinstance(instructions, str): instructions = [instructions]
+                if not instructions: instructions = [llm_response.content]
+                
+                return {
+                    "status": "success",
+                    "recipe_name": recipe_data.get("name", "AI-Generated Healthy Dish"),
+                    "ingredients": ingredients,
+                    "instructions": instructions,
+                    "nutrition": recipe_data.get("nutrition", total_nutrition),
+                    "serves": 2,
+                    "powered_by": "ollama_gemma",
+                    "health_note": recipe_data.get("health_note", "Recipe tailored to your health profile.")
+                }
+            except Exception as e:
+                print(f"[RECIPE] AI JSON parsing failed: {e}. Falling back to raw content.")
+                # Even if parsing fails, split by lines to avoid one massive block
+                raw_lines = [line.strip() for line in llm_response.content.split('\n') if line.strip()]
+                return {
+                    "status": "success",
+                    "recipe_name": f"AI-Generated Healthy Dish",
+                    "ingredients": request.ingredients,
+                    "instructions": raw_lines, 
+                    "nutrition": total_nutrition,
+                    "serves": 2,
+                    "powered_by": "ollama_gemma",
+                    "health_note": "Recipe tailored to your health profile."
+                }
+        else:
+            print(f"[RECIPE] AI generation failed, falling back: {llm_response.error}")
+
+    # Fallback to simple template-based recipe
     recipe_name = f"Healthy {request.ingredients[0].split()[-1].title()} Dish"
     
     instructions = [
@@ -1745,6 +1829,7 @@ async def generate_recipe(
         "instructions": instructions,
         "nutrition": total_nutrition,
         "serves": 2,
+        "fallback_mode": True
     }
 
 

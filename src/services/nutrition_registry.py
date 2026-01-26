@@ -116,6 +116,20 @@ class NutritionRegistry:
         result = self._indexed_data.get(clean_name)
         if result: return result
         
+        # 1b. Try variations (e.g., gobi vs gobhi)
+        variations = [
+            clean_name.replace("gobi", "gobhi"),
+            clean_name.replace("gobhi", "gobi"),
+            clean_name.replace("paratha", "parantha"),
+            clean_name.replace("parantha", "paratha")
+        ]
+        for var in variations:
+            if var != clean_name:
+                result = self._indexed_data.get(var)
+                if result:
+                    print(f"[Registry] Match found for variation: {var}")
+                    return result
+
         # 2. Fuzzy fallback
         fuzzy_results = self.fuzzy_search(name, limit=1)
         if fuzzy_results:

@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Debug Auth</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            background: #222;
+            color: #0f0;
+        }
+
+        .success {
+            color: #0f0;
+        }
+
+        .error {
+            color: #f00;
+        }
+
+        .warn {
+            color: #ff0;
+        }
+
+        div {
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Backend Connectivity Test</h2>
+    <div id="logs"></div>
+    <script>
+        const log = (msg, type = 'info') => {
+            const el = document.getElementById('logs');
+            const color = type === 'error' ? 'red' : type === 'success' ? '#0f0' : '#ccc';
+            el.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+        };
+
+        async function testEndpoint(url, method = 'GET', body = null) {
+            log(`Testing ${method} ${url}...`);
+            try {
+                const opts = { method };
+                if (body) {
+                    opts.body = JSON.stringify(body);
+                    opts.headers = { 'Content-Type': 'application/json' };
+                }
+                const res = await fetch(url, opts);
+                log(`Response Status: ${res.status} (${res.statusText})`, res.ok ? 'success' : 'warn');
+
+                if (res.status === 404) {
+                    log(`❌ CRITICAL: Endpoint ${url} NOT FOUND. Server is stale/running old code.`, 'error');
+                    return;
+                }
+
+                try {
+                    const data = await res.json();
+                    log(`Response Data: ${JSON.stringify(data).substring(0, 100)}...`, 'info');
+                } catch (e) {
+                    log(`Response is not JSON: ${await res.text()}`, 'warn');
+                }
+
+            } catch (err) {
+                log(`Network Error: ${err.message}`, 'error');
+                log(`Is the server running?`, 'error');
+            }
+        }
+
+        async function runTests() {
+            log("Starting tests...", 'info');
+
+            // Test 1: Healthcheck (app.html availability)
+            await testEndpoint('/static/app.html');
+
+            // Test 2: New Login Endpoint
+            await testEndpoint('/auth/login', 'POST', { email: 'test@example.com', password: 'test' });
+
+            // Test 3: Legacy Login Endpoint
+            await testEndpoint('/api/auth/login', 'POST', { username: 'test@example.com', password: 'test' });
+
+            // Test 4: Profile Endpoint
+            await testEndpoint('/api/profile/get');
+
+            log("Tests complete.", 'info');
+            log("--- CONCLUSION ---", 'warn');
+            log(`If '/auth/login' is 404 -> RESTART SERVER.`, 'warn');
+            log(`If all are Network Errors -> START SERVER.`, 'warn');
+        }
+
+        runTests();
+    </script>
+</body>
+
+</html>
