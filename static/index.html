@@ -545,9 +545,17 @@
 
                 const response = await fetch(API_BASE + '/api/coach/chat', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
                     body: JSON.stringify({ message }),
                 });
+                if (response.status === 401) {
+                    localStorage.removeItem('token');
+                    window.location.href = 'login.html';
+                    return;
+                }
                 const data = await response.json();
                 addMessage(data.message, 'assistant', data.safety_level);
             } catch (error) {
@@ -568,18 +576,24 @@
         async function loadDashboard() {
             try {
                 // Load health score
-                const scoreRes = await fetch(API_BASE + '/api/analytics/score');
+                const scoreRes = await fetch(API_BASE + '/api/analytics/score', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
                 const score = await scoreRes.json();
                 document.getElementById('health-score').textContent = score.overall_score;
                 document.getElementById('score-explanation').textContent = score.explanation;
 
                 // Load insight
-                const insightRes = await fetch(API_BASE + '/api/analytics/insight');
+                const insightRes = await fetch(API_BASE + '/api/analytics/insight', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
                 const insight = await insightRes.json();
                 document.getElementById('daily-insight').textContent = insight.insight;
 
                 // Load patterns
-                const patternsRes = await fetch(API_BASE + '/api/analytics/patterns');
+                const patternsRes = await fetch(API_BASE + '/api/analytics/patterns', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
                 const patterns = await patternsRes.json();
                 const patternsList = document.getElementById('patterns-list');
 
@@ -614,7 +628,10 @@
             try {
                 const response = await fetch(API_BASE + '/api/food/analyze', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
                     body: JSON.stringify(food),
                 });
                 const data = await response.json();
@@ -645,7 +662,10 @@
             try {
                 const response = await fetch(API_BASE + '/api/food/log', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
                     body: JSON.stringify({ foods: [food] }),
                 });
                 const data = await response.json();

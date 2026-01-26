@@ -156,9 +156,11 @@ class UserProfile:
     
     # Physical attributes (for calorie calculation)
     age: Optional[int] = None
+    gender: Optional[str] = "male"  # Default fallback
     weight_kg: Optional[float] = None
     height_cm: Optional[float] = None
     activity_level: ActivityLevel = ActivityLevel.MODERATELY_ACTIVE
+    fitness_goal: Optional[str] = "maintenance"
     
     def has_condition(self, condition: HealthCondition) -> bool:
         """Check if user has a specific health condition."""
@@ -176,12 +178,16 @@ class UserProfile:
         if not all([self.age, self.weight_kg, self.height_cm]):
             return None
         
-        # Mifflin-St Jeor (using average of male/female since gender not stored)
+        # Mifflin-St Jeor Equation
         # Male: 10*weight + 6.25*height - 5*age + 5
         # Female: 10*weight + 6.25*height - 5*age - 161
-        # Average: 10*weight + 6.25*height - 5*age - 78
-        bmr = 10 * self.weight_kg + 6.25 * self.height_cm - 5 * self.age - 78
-        return bmr
+        
+        base_bmr = 10 * self.weight_kg + 6.25 * self.height_cm - 5 * self.age
+        
+        if self.gender and self.gender.lower() == 'female':
+            return base_bmr - 161
+        else:
+            return base_bmr + 5
     
     def calculate_tdee(self) -> Optional[float]:
         """
@@ -210,9 +216,11 @@ class UserProfile:
             "conditions": [c.value for c in self.conditions],
             "allergens": self.allergens,
             "age": self.age,
+            "gender": self.gender,
             "weight_kg": self.weight_kg,
             "height_cm": self.height_cm,
             "activity_level": self.activity_level.value,
+            "fitness_goal": self.fitness_goal,
         }
     
     @classmethod
@@ -235,6 +243,13 @@ class UserProfile:
         else:
             targets = DailyTargets()
         
+        # Handle activity level enum safely
+        activity_str = data.get("activity_level", "moderately_active")
+        try:
+            activity = ActivityLevel(activity_str)
+        except ValueError:
+            activity = ActivityLevel.MODERATELY_ACTIVE
+            
         return cls(
             user_id=data["user_id"],
             name=data["name"],
@@ -242,7 +257,9 @@ class UserProfile:
             allergens=data.get("allergens", []),
             daily_targets=targets,
             age=data.get("age"),
+            gender=data.get("gender"),
             weight_kg=data.get("weight_kg"),
             height_cm=data.get("height_cm"),
-            activity_level=ActivityLevel(data.get("activity_level", "moderately_active")),
+            activity_level=activity,
+            fitness_goal=data.get("fitness_goal"),
         )

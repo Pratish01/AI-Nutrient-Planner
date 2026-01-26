@@ -651,11 +651,19 @@
 
                 <div class="health-card">
                     <div class="health-card-header">
-                        <div class="health-card-icon">📋</div>
-                        <span class="health-card-title">Medical Profile</span>
+                        <div class="health-card-icon">👤</div>
+                        <span class="health-card-title">Bio-Metrics</span>
                     </div>
-                    <span class="status-badge pending" id="profileBadge">⏳ Pending</span>
-                    <p class="health-card-sub">Upload for personalized advice</p>
+                    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                        <div>
+                            <span class="health-card-value" id="bmiValue">--</span>
+                            <span class="health-card-sub" id="bmiStatus" style="font-size: 11px;">BMI</span>
+                        </div>
+                        <div style="text-align: right;">
+                            <div style="font-size: 13px; font-weight: 600;" id="weightValue">-- kg</div>
+                            <div style="font-size: 11px; color: var(--text-muted);" id="heightValue">-- cm</div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="health-card">
@@ -663,7 +671,7 @@
                         <div class="health-card-icon">⚠️</div>
                         <span class="health-card-title">Conditions</span>
                     </div>
-                    <div id="conditionsTags"><span class="tag">No data</span></div>
+                    <div id="conditionsTags"><span class="tag">Loading...</span></div>
                 </div>
 
                 <div class="health-card">
@@ -671,7 +679,7 @@
                         <div class="health-card-icon">🚫</div>
                         <span class="health-card-title">Allergies</span>
                     </div>
-                    <div id="allergiesTags"><span class="tag">No data</span></div>
+                    <div id="allergiesTags"><span class="tag">Loading...</span></div>
                 </div>
             </section>
 
@@ -746,18 +754,18 @@
                         <a href="food-scan.html" class="action-card-btn">Scan →</a>
                     </div>
 
-                    <div class="action-card" onclick="location.href='app.html'">
-                        <div class="action-card-icon">🔧</div>
-                        <h3>Fix My Meal</h3>
-                        <p>Get healthier alternatives for your current meal.</p>
-                        <a href="app.html" class="action-card-btn">Fix Meal →</a>
+                    <div class="action-card" onclick="location.href='app.html?mode=recipe'">
+                        <div class="action-card-icon">📖</div>
+                        <h3>Recipe Generator</h3>
+                        <p>Generate healthy recipes from your ingredients.</p>
+                        <a href="app.html?mode=recipe" class="action-card-btn">Create →</a>
                     </div>
 
-                    <div class="action-card" onclick="location.href='app.html'">
-                        <div class="action-card-icon">💬</div>
-                        <h3>AI Nutrition Coach</h3>
-                        <p>Ask questions about diet, nutrition, and health.</p>
-                        <a href="app.html" class="action-card-btn">Chat →</a>
+                    <div class="action-card" onclick="location.href='app.html?mode=analyze'">
+                        <div class="action-card-icon">📊</div>
+                        <h3>Analyze Nutrition</h3>
+                        <p>Analyze food nutrition and ask questions.</p>
+                        <a href="app.html?mode=analyze" class="action-card-btn">Analyze →</a>
                     </div>
                 </div>
             </section>
@@ -884,12 +892,19 @@
                 }
 
                 if (!response.ok) {
-                    // No profile yet
-                    document.getElementById('uploadReportCard').classList.add('priority');
+                    // No profile at all, redirect to setup
+                    window.location.href = 'setup-profile.html';
                     return;
                 }
 
                 const data = await response.json();
+
+                // Check if bio-metrics are missing
+                if (!data.bio_metrics || !data.bio_metrics.age || !data.bio_metrics.weight_kg) {
+                    window.location.href = 'setup-profile.html';
+                    return;
+                }
+
                 updateProfileUI(data);
             } catch (err) {
                 console.error('Profile load error:', err);
@@ -897,22 +912,41 @@
         }
 
         function updateProfileUI(profile) {
-            // Update profile badge
-            if (profile.conditions?.length > 0 || profile.allergies?.length > 0) {
-                document.getElementById('profileBadge').className = 'status-badge safe';
-                document.getElementById('profileBadge').innerHTML = '✓ Complete';
+            // Update Bio-Metrics UI
+            if (profile.bio_metrics) {
+                const bm = profile.bio_metrics;
+
+                // BMI Calculation
+                if (bm.weight_kg && bm.height_cm) {
+                    const heightM = bm.height_cm / 100;
+                    const bmi = (bm.weight_kg / (heightM * heightM)).toFixed(1);
+                    document.getElementById('bmiValue').textContent = bmi;
+
+                    let status = 'Normal';
+                    if (bmi < 18.5) status = 'Underweight';
+                    else if (bmi >= 25 && bmi < 30) status = 'Overweight';
+                    else if (bmi >= 30) status = 'Obese';
+                    document.getElementById('bmiStatus').textContent = `BMI (${status})`;
+                }
+
+                if (bm.weight_kg) document.getElementById('weightValue').textContent = `${bm.weight_kg} kg`;
+                if (bm.height_cm) document.getElementById('heightValue').textContent = `${bm.height_cm} cm`;
             }
 
-            // Update conditions
-            if (profile.conditions?.length > 0) {
+            // Update conditions (default to "None" if empty list)
+            if (profile.conditions && profile.conditions.length > 0) {
                 document.getElementById('conditionsTags').innerHTML =
                     profile.conditions.map(c => `<span class="tag condition">${c}</span>`).join('');
+            } else {
+                document.getElementById('conditionsTags').innerHTML = '<span class="tag">None</span>';
             }
 
             // Update allergies
-            if (profile.allergies?.length > 0) {
+            if (profile.allergies && profile.allergies.length > 0) {
                 document.getElementById('allergiesTags').innerHTML =
                     profile.allergies.map(a => `<span class="tag allergy">${a}</span>`).join('');
+            } else {
+                document.getElementById('allergiesTags').innerHTML = '<span class="tag">None</span>';
             }
 
             // Update vitals (from medical report)
@@ -1153,9 +1187,18 @@
             try {
                 const response = await fetch('/api/exercise/chat', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
                     body: JSON.stringify({ message })
                 });
+
+                if (response.status === 401) {
+                    localStorage.removeItem('token');
+                    window.location.href = 'login.html';
+                    return;
+                }
 
                 const data = await response.json();
 

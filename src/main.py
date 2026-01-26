@@ -48,7 +48,7 @@ except ImportError as e:
     ) from e
 
 from models.food import Food, NutritionInfo, FoodCategory
-from models.user import UserProfile, HealthCondition, DailyTargets, DailyIntake
+from models.user import UserProfile, HealthCondition, DailyTargets, DailyIntake, ActivityLevel
 from rules.engine import RuleEngine
 from coach.virtual_coach import VirtualCoach
 from analytics.analytics_service import AnalyticsService, MealLogStore
@@ -204,7 +204,7 @@ async def get_optional_user(authorization: Optional[str] = Header(None)):
     return payload  # Returns None if invalid
 
 
-def get_user_profile_for_rules(user_id: str = "demo_user_123") -> UserProfile:
+def get_user_profile_for_rules(user_id: str) -> UserProfile:
     """
     Load user's medical profile from database and construct a UserProfile
     object with proper HealthCondition enums for rule engine evaluation.
@@ -253,6 +253,12 @@ def get_user_profile_for_rules(user_id: str = "demo_user_123") -> UserProfile:
         conditions=conditions,
         allergens=allergens,
         daily_targets=targets,
+        age=db_profile.get("age"),
+        gender=db_profile.get("gender"),
+        weight_kg=db_profile.get("weight_kg"),
+        height_cm=db_profile.get("height_cm"),
+        activity_level=ActivityLevel(db_profile.get("activity_level", "moderately_active")),
+        fitness_goal=db_profile.get("fitness_goal"),
     )
     
     print(f"[RuleEngine] Loaded profile for {user_id}: conditions={[c.value for c in conditions]}, allergens={allergens}")
@@ -300,10 +306,10 @@ async def health_check():
 # =============================================================================
 
 @app.post("/api/coach/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, user: dict = Depends(get_current_user)):
     """Chat with the Virtual Coach using RAG + Mistral LLM."""
     try:
-        user_id = "demo_user_123"  # Demo mode
+        user_id = user["sub"]
         
         # =====================================================
         # RAG STEP 1: RETRIEVAL - Auto-fetch food context
@@ -447,6 +453,11 @@ async def chat(request: ChatRequest):
                 profile_header += f"• Medications: {', '.join(profile['medications'])}\n"
             profile_header += "\n---\n\n"
         
+        # Isolation fix: Update virtual_coach state for current user
+        user_profile = get_user_profile_for_rules(user_id)
+        virtual_coach.user = user_profile
+        virtual_coach.context.user_id = user_id
+        
         response = virtual_coach.respond(request.message, food=food)
         
         return ChatResponse(
@@ -508,13 +519,13 @@ EXERCISE_DATA = {
 }
 
 @app.post("/api/exercise/chat")
-async def exercise_chat(request: ExerciseRequest):
+async def exercise_chat(request: ExerciseRequest, user: dict = Depends(get_current_user)):
     """
     Exercise Guidance AI - provides general fitness advice.
     Uses Ollama/Gemma LLM for intelligent responses.
     Shows user health profile for personalized context.
     """
-    user_id = "demo_user_123"
+    user_id = user["sub"]
     message = request.message.lower().strip()
     
     # Get user profile for personalized advice
@@ -644,15 +655,12 @@ CONDITION_THRESHOLDS = {
 }
 
 @app.post("/api/meal/fix")
-async def fix_meal_endpoint(request: FixMealRequest, user: dict = Depends(get_optional_user)):
+async def fix_meal_endpoint(request: FixMealRequest, user: dict = Depends(get_current_user)):
     """
     Clinical Nutrition AI - analyzes meal and suggests improvements.
     Uses detected food data, portion estimation, and user medical profile.
     Provides actionable fix suggestions based on nutritional analysis.
     """
-    if not user:
-        user = {"sub": "demo_user_123"}
-    
     user_id = user["sub"]
     
     # Get food data - from request or auto-fetch from context
@@ -866,53 +874,63 @@ INSTRUCTIONS:
 # =============================================================================
 
 @app.get("/api/analytics/score")
-async def get_health_score():
+async def get_health_score(user: dict = Depends(get_current_user)):
     """Get current health score."""
+    user_id = user["sub"]
+    user_profile = get_user_profile_for_rules(user_id)
     score = analytics_service.compute_health_score(
-        demo_user.user_id,
-        demo_user.daily_targets,
+        user_id,
+        user_profile.daily_targets,
     )
     return score.to_dict()
 
 
 @app.get("/api/analytics/trends")
-async def get_trends(days: int = 7):
+async def get_trends(days: int = 7, user: dict = Depends(get_current_user)):
     """Get nutrient trends."""
+    user_id = user["sub"]
+    user_profile = get_user_profile_for_rules(user_id)
     trends = analytics_service.compute_daily_trends(
-        demo_user.user_id,
-        demo_user.daily_targets,
+        user_id,
+        user_profile.daily_targets,
         days=days,
     )
     return {k: v.to_dict() for k, v in trends.items()}
 
 
 @app.get("/api/analytics/patterns")
-async def get_patterns(days: int = 14):
+async def get_patterns(days: int = 14, user: dict = Depends(get_current_user)):
     """Get detected behavior patterns."""
+    user_id = user["sub"]
+    user_profile = get_user_profile_for_rules(user_id)
     patterns = analytics_service.detect_patterns(
-        demo_user.user_id,
-        demo_user.daily_targets,
+        user_id,
+        user_profile.daily_targets,
         days=days,
     )
     return [p.to_dict() for p in patterns]
 
 
 @app.get("/api/analytics/insight")
-async def get_insight():
+async def get_insight(user: dict = Depends(get_current_user)):
     """Get daily actionable insight."""
+    user_id = user["sub"]
+    user_profile = get_user_profile_for_rules(user_id)
     insight = analytics_service.generate_insight(
-        demo_user.user_id,
-        demo_user.daily_targets,
+        user_id,
+        user_profile.daily_targets,
     )
     return {"insight": insight}
 
 
 @app.get("/api/analytics/snapshot")
-async def get_snapshot():
+async def get_snapshot(user: dict = Depends(get_current_user)):
     """Get complete analytics snapshot."""
+    user_id = user["sub"]
+    user_profile = get_user_profile_for_rules(user_id)
     snapshot = analytics_service.get_snapshot(
-        demo_user.user_id,
-        demo_user.daily_targets,
+        user_id,
+        user_profile.daily_targets,
     )
     return snapshot.to_dict()
 
@@ -947,15 +965,16 @@ async def get_feature_importance():
 
 
 @app.post("/api/food/analyze")
-async def analyze_food(food: FoodInput):
+async def analyze_food(food: FoodInput, user: dict = Depends(get_current_user)):
     """Analyze a food item for safety."""
+    user_id = user["sub"]
     # Ensure carbs >= sugar + fiber (validation requirement)
     carbs_g = food.carbs_g
     if carbs_g < food.sugar_g + food.fiber_g:
         carbs_g = food.sugar_g + food.fiber_g
     
     # Load user's actual profile for rule evaluation
-    user_profile = get_user_profile_for_rules("demo_user_123")
+    user_profile = get_user_profile_for_rules(user_id)
     
     food_obj = Food(
         food_id=f"analyze-{datetime.now().timestamp()}",
@@ -986,8 +1005,9 @@ async def analyze_food(food: FoodInput):
 
 
 @app.post("/api/food/log")
-async def log_meal(request: LogMealRequest):
+async def log_meal(request: LogMealRequest, user: dict = Depends(get_current_user)):
     """Log a meal."""
+    user_id = user["sub"]
     foods = []
     for f in request.foods:
         foods.append({
@@ -1002,7 +1022,7 @@ async def log_meal(request: LogMealRequest):
         })
     
     entry = analytics_service.log_meal(
-        user_id=demo_user.user_id,
+        user_id=user_id,
         foods=foods,
     )
     
@@ -1018,10 +1038,11 @@ async def log_meal(request: LogMealRequest):
 # =============================================================================
 
 @app.post("/api/feedback")
-async def submit_feedback(request: FeedbackRequest):
+async def submit_feedback(request: FeedbackRequest, user: dict = Depends(get_current_user)):
     """Submit feedback on a response."""
+    user_id = user["sub"]
     feedback = feedback_service.submit_feedback(
-        user_id=demo_user.user_id,
+        user_id=user_id,
         context_type=request.context_type,
         context_id=request.context_id,
         rating=request.rating,
@@ -1035,15 +1056,10 @@ async def submit_feedback(request: FeedbackRequest):
 # =============================================================================
 
 @app.get("/api/profile")
-async def get_profile(user: dict = None):
+async def get_profile(user: dict = Depends(get_current_user)):
     """
     Get current user's medical profile from database.
-    TEMP: Auth optional for testing.
     """
-    # For testing: use demo user if no auth
-    if not user:
-        user = {"sub": "demo_user_123"}
-    
     user_id = user["sub"]
     print(f"[API] Loading profile for user: {user_id}")
     
@@ -1086,6 +1102,14 @@ async def get_profile(user: dict = None):
         "source": "medical_report_ocr",
         "source_file": profile.get("source_file"),
         "created_at": profile.get("created_at"),
+        "bio_metrics": {
+            "age": profile.get("age"),
+            "gender": profile.get("gender"),
+            "weight_kg": profile.get("weight_kg"),
+            "height_cm": profile.get("height_cm"),
+            "activity_level": profile.get("activity_level"),
+            "fitness_goal": profile.get("fitness_goal"),
+        }
     }
 
 
@@ -1103,15 +1127,12 @@ async def get_user_profile_legacy(user: dict = Depends(get_current_user)):
 @app.post("/api/medical-report/upload")
 async def upload_medical_report(
     file: UploadFile = File(...),
-    user: dict = None,  # TEMP: Auth optional for testing
+    user: dict = Depends(get_current_user),
 ):
     """
     Upload a medical report and extract conditions, allergens, and vitals.
     Uses OCR to parse the document.
     """
-    if not user:
-        user = {"sub": "demo_user_123"}
-    
     user_id = user["sub"]
     print(f"\n[MEDICAL REPORT] ====== Processing medical report ======")
     print(f"[MEDICAL REPORT] User: {user_id}")
@@ -1383,6 +1404,64 @@ async def upload_medical_report_legacy(
 
 
 # =============================================================================
+# ROUTES: PROFILE COMPLETION
+# =============================================================================
+
+class CompleteProfileRequest(BaseModel):
+    age: int
+    gender: str
+    weight_kg: float
+    height_cm: float
+    activity_level: str
+    fitness_goal: str
+
+
+@app.post("/api/user/complete-profile")
+async def complete_profile(
+    request: CompleteProfileRequest,
+    user: dict = Depends(get_current_user)
+):
+    """
+    Complete user profile with bio-metrics.
+    """
+    user_id = user["sub"]
+    
+    # Check if profile exists, if not create one
+    existing_profile = MedicalProfileRepository.get_by_user_id(user_id)
+    
+    if existing_profile:
+        # Update existing
+        success = MedicalProfileRepository.update(
+            user_id=user_id,
+            age=request.age,
+            gender=request.gender,
+            weight_kg=request.weight_kg,
+            height_cm=request.height_cm,
+            activity_level=request.activity_level,
+            fitness_goal=request.fitness_goal
+        )
+    else:
+        # Create new
+        success = MedicalProfileRepository.create(
+            profile_id=str(uuid.uuid4()),
+            user_id=user_id,
+            conditions=[],
+            allergens=[],
+            age=request.age,
+            gender=request.gender,
+            weight_kg=request.weight_kg,
+            height_cm=request.height_cm,
+            activity_level=request.activity_level,
+            fitness_goal=request.fitness_goal
+        )
+    
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to save profile")
+        
+    return {"status": "success", "message": "Profile completed successfully"}
+
+
+# =============================================================================
 # ROUTES: FOOD IMAGE UPLOAD
 # =============================================================================
 
@@ -1454,23 +1533,11 @@ FOOD_DATABASE = _load_food_database()
 @app.post("/api/food/upload")
 async def upload_food_image(
     file: UploadFile = File(...),
-    user: dict = None,  # TEMP: Auth optional for testing
+    user: dict = Depends(get_current_user),
 ):
     """
     Upload food image, run OCR, and return nutrition data.
-    
-    Flow:
-    1. Accept image
-    2. Run OCR to detect food/nutrition label
-    3. If nutrition found, use it
-    4. If not, detect food name and use USDA fallback
-    5. Apply medical safety rules
-    6. Return structured data
     """
-    # Use demo user if no auth (matches meals endpoint)
-    if not user:
-        user = {"sub": "demo_user_123"}
-    
     user_id = user["sub"]
     
     print(f"\n[FOOD UPLOAD] ====== Starting food image analysis ======")
@@ -1620,15 +1687,10 @@ async def upload_food_image(
 # =============================================================================
 
 @app.get("/api/meals/today")
-async def get_today_meals(user: dict = None):
+async def get_today_meals(user: dict = Depends(get_current_user)):
     """
     Get all meals logged today by the current user.
-    TEMP: Auth optional for testing.
     """
-    # For testing: use demo user if no auth
-    if not user:
-        user = {"sub": "demo_user_123"}
-    
     user_id = user["sub"]
     today = datetime.now().date()
     
@@ -1653,10 +1715,8 @@ async def get_today_meals(user: dict = None):
 
 
 @app.delete("/api/meals/clear")
-async def clear_meals(user: dict = None):
+async def clear_meals(user: dict = Depends(get_current_user)):
     """Clear all meals for the current user (for testing)."""
-    if not user:
-        user = {"sub": "demo_user_123"}
     user_id = user["sub"]
     if user_id in user_meal_logs:
         user_meal_logs[user_id] = []
@@ -1664,16 +1724,13 @@ async def clear_meals(user: dict = None):
 
 
 @app.get("/api/food/current")
-async def get_current_food(user: dict = None):
+async def get_current_food(user: dict = Depends(get_current_user)):
     """
     Get the most recently scanned food for immediate AI coach context.
     
     This is THE PRIMARY endpoint the AI coach should use.
     Returns the food that was just analyzed, with full nutrition data.
     """
-    if not user:
-        user = {"sub": "demo_user_123"}
-    
     user_id = user["sub"]
     
     if user_id not in current_food_context:
@@ -1712,20 +1769,12 @@ class RecipeRequest(BaseModel):
 @app.post("/api/recipe/generate")
 async def generate_recipe(
     request: RecipeRequest,
-    user: dict = Depends(get_optional_user),
+    user: dict = Depends(get_current_user),
 ):
     """
     Generate a recipe from ingredients.
-    
-    Flow:
-    1. Parse ingredients
-    2. Check medical constraints
-    3. Generate recipe
-    4. Validate against rules
     """
-    # Demo mode fallback
-    if not user:
-        user = {"sub": "demo_user_123"}
+    user_id = user["sub"]
     
     if not request.ingredients:
         raise HTTPException(status_code=400, detail="No ingredients provided")
@@ -1744,9 +1793,8 @@ async def generate_recipe(
                 total_nutrition["fat_g"] += data.get("fat_g", 0)
                 break
     
-    # Fetch medical profile via RAG for personalization
     rag_service = get_rag_service()
-    profile = rag_service.get_medical_profile(user.get("sub", "demo_user_123"))
+    profile = rag_service.get_medical_profile(user_id)
     
     # Try AI-powered generation first
     llm_service = get_llm_service()
@@ -1779,9 +1827,9 @@ async def generate_recipe(
                 ingredients = recipe_data.get("ingredients", request.ingredients)
                 if isinstance(ingredients, str): ingredients = [ingredients]
                 
-                instructions = recipe_data.get("instructions", [])
+                instructions = recipe_data.get("instructions") or recipe_data.get("steps") or recipe_data.get("preparation") or recipe_data.get("method") or []
                 if isinstance(instructions, str): instructions = [instructions]
-                if not instructions: instructions = [llm_response.content]
+                if not instructions: instructions = ["No instructions generated via AI. Please try again."]
                 
                 return {
                     "status": "success",

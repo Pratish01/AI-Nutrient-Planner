@@ -66,6 +66,24 @@ def init_database():
             )
         """)
         
+        # Migrations: Add new columns if they don't exist
+        new_columns = [
+            ("age", "INTEGER"),
+            ("gender", "TEXT"),
+            ("weight_kg", "REAL"),
+            ("height_cm", "REAL"),
+            ("activity_level", "TEXT"),
+            ("fitness_goal", "TEXT")
+        ]
+        
+        for col_name, col_type in new_columns:
+            try:
+                cursor.execute(f"ALTER TABLE medical_profiles ADD COLUMN {col_name} {col_type}")
+                print(f"[DB] Added column {col_name} to medical_profiles")
+            except sqlite3.OperationalError:
+                # Column likely already exists
+                pass
+
         conn.commit()
 
 
@@ -134,6 +152,7 @@ class MedicalProfileRepository:
         daily_targets: Dict[str, float] = None,
         raw_ocr_text: str = None,
         source_file: str = None,
+        **kwargs
     ) -> bool:
         """Create a medical profile."""
         try:
@@ -141,8 +160,8 @@ class MedicalProfileRepository:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT INTO medical_profiles 
-                    (id, user_id, conditions, allergens, medications, daily_targets, raw_ocr_text, source_file)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, user_id, conditions, allergens, medications, daily_targets, raw_ocr_text, source_file, age, gender, weight_kg, height_cm, activity_level, fitness_goal)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     profile_id,
                     user_id,
@@ -152,6 +171,12 @@ class MedicalProfileRepository:
                     json.dumps(daily_targets or {}),
                     raw_ocr_text,
                     source_file,
+                    kwargs.get('age'),
+                    kwargs.get('gender'),
+                    kwargs.get('weight_kg'),
+                    kwargs.get('height_cm'),
+                    kwargs.get('activity_level'),
+                    kwargs.get('fitness_goal'),
                 ))
                 conn.commit()
                 return True
@@ -185,6 +210,7 @@ class MedicalProfileRepository:
         conditions: List[str] = None,
         allergens: List[str] = None,
         medications: List[str] = None,
+        **kwargs
     ) -> bool:
         """Update an existing profile."""
         with get_connection() as conn:
@@ -201,6 +227,12 @@ class MedicalProfileRepository:
             if medications is not None:
                 updates.append("medications = ?")
                 values.append(json.dumps(medications))
+            
+            # New fields
+            for field in ['age', 'gender', 'weight_kg', 'height_cm', 'activity_level', 'fitness_goal']:
+                if field in kwargs:
+                    updates.append(f"{field} = ?")
+                    values.append(kwargs[field])
             
             if updates:
                 updates.append("updated_at = ?")

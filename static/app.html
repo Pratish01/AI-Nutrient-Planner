@@ -465,10 +465,11 @@
         <!-- Input Section -->
         <div class="input-section">
             <div class="input-tabs">
-                <button class="input-tab active" onclick="switchInput('text')">📝 Text</button>
-                <button class="input-tab" onclick="switchInput('voice')">🎤 Voice</button>
-                <button class="input-tab" onclick="switchInput('image')">📷 Image</button>
-                <button class="input-tab" onclick="switchInput('ingredients')">🥕 Ingredients</button>
+                <button id="tab-text" class="input-tab active" onclick="switchInput('text')">📝 Text</button>
+                <button id="tab-voice" class="input-tab" onclick="switchInput('voice')">🎤 Voice</button>
+                <button id="tab-image" class="input-tab" onclick="switchInput('image')">📷 Image</button>
+                <button id="tab-ingredients" class="input-tab" onclick="switchInput('ingredients')">🥕
+                    Ingredients</button>
             </div>
 
             <!-- Text Input -->
@@ -510,22 +511,22 @@
 
         <!-- Action Cards -->
         <div class="actions-section">
-            <div class="action-card" onclick="selectAction('scan')">
+            <div id="card-analyze" class="action-card" onclick="selectAction('scan')">
                 <div class="action-icon">📊</div>
                 <h3>Analyze Food</h3>
                 <p>Get nutrition info and safety check</p>
             </div>
-            <div class="action-card" onclick="selectAction('fix')">
+            <div id="card-fix" class="action-card" onclick="selectAction('fix')">
                 <div class="action-icon">🔧</div>
                 <h3>Fix My Meal</h3>
                 <p>Get healthier alternatives</p>
             </div>
-            <div class="action-card" onclick="selectAction('recipe')">
+            <div id="card-recipe" class="action-card" onclick="selectAction('recipe')">
                 <div class="action-icon">📖</div>
                 <h3>Generate Recipe</h3>
                 <p>Create recipe from ingredients</p>
             </div>
-            <div class="action-card" onclick="selectAction('coach')">
+            <div id="card-coach" class="action-card" onclick="selectAction('coach')">
                 <div class="action-icon">💬</div>
                 <h3>AI Coach</h3>
                 <p>Ask nutrition questions</p>
@@ -554,20 +555,75 @@
         let selectedAction = 'scan';
         let recognition = null;
 
+        // Handle Query Params
+        const urlParams = new URLSearchParams(window.location.search);
+        const mode = urlParams.get('mode');
+
+        if (mode === 'recipe') {
+            switchInput('ingredients');
+            selectAction('recipe');
+
+            // Hide other tabs
+            document.getElementById('tab-text').style.display = 'none';
+            document.getElementById('tab-voice').style.display = 'none';
+            document.getElementById('tab-image').style.display = 'none';
+
+            // Hide other cards
+            document.getElementById('card-analyze').style.display = 'none';
+            document.getElementById('card-fix').style.display = 'none';
+            document.getElementById('card-coach').style.display = 'none';
+
+        } else if (mode === 'analyze') {
+            switchInput('text');
+            selectAction('coach'); // Coach/Analyze logic
+
+            // Hide recipe tab
+            document.getElementById('tab-ingredients').style.display = 'none';
+
+            // Hide recipe and fix cards
+            const cardRecipe = document.getElementById('card-recipe');
+            if (cardRecipe) cardRecipe.style.display = 'none';
+
+            const cardFix = document.getElementById('card-fix');
+            if (cardFix) cardFix.style.display = 'none';
+
+            // Also hide Analyze and Coach cards as they are redundant in this mode
+            const cardAnalyze = document.getElementById('card-analyze');
+            if (cardAnalyze) cardAnalyze.style.display = 'none';
+
+            const cardCoach = document.getElementById('card-coach');
+            if (cardCoach) cardCoach.style.display = 'none';
+
+        } else if (mode === 'fix') {
+            switchInput('image');
+            selectAction('fix');
+        }
+
         // Input Tab Switching
         function switchInput(type) {
             document.querySelectorAll('.input-tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.input-content').forEach(c => c.classList.remove('active'));
 
-            event.target.classList.add('active');
-            document.getElementById(type + 'Input').classList.add('active');
+            const tab = document.getElementById('tab-' + type);
+            if (tab) tab.classList.add('active');
+
+            const content = document.getElementById(type + 'Input');
+            if (content) content.classList.add('active');
         }
 
         // Action Selection
         function selectAction(action) {
             selectedAction = action;
             document.querySelectorAll('.action-card').forEach(c => c.classList.remove('selected'));
-            event.currentTarget.classList.add('selected');
+
+            // Find the card by ID and select it
+            const cardId = 'card-' + (action === 'scan' ? 'analyze' : action);
+            // Note: 'scan' maps to 'card-analyze' based on previous HTML
+
+            const card = document.getElementById(cardId);
+            if (card) {
+                card.classList.add('selected');
+            }
         }
 
         // Text Submit - Backend handles RAG (auto-fetches food context)
@@ -725,11 +781,10 @@
         function showCoachResponse(question, data) {
             const results = document.getElementById('resultsSection');
             const content = document.getElementById('resultsContent');
-            document.getElementById('resultsTitle').textContent = 'AI Coach';
 
-            const badge = document.getElementById('safetyBadge');
-            badge.className = 'safety-badge ' + (data.safety_level === 'safe' ? 'safe' : 'warning');
-            badge.textContent = data.safety_level === 'safe' ? '✓ Safe' : '⚠ ' + data.safety_level;
+            // Hide the redundant header in Coach mode
+            const header = document.querySelector('.results-header');
+            if (header) header.style.display = 'none';
 
             content.innerHTML = `
                 <div class="chat-messages">
@@ -810,25 +865,47 @@
         function showRecipeResults(data) {
             const results = document.getElementById('resultsSection');
             const content = document.getElementById('resultsContent');
-            document.getElementById('resultsTitle').textContent = data.recipe_name || 'Generated Recipe';
+
+            // Ensure data is an object
+            let recipe = data;
+            if (typeof data === 'string') {
+                try {
+                    recipe = JSON.parse(data);
+                } catch (e) {
+                    console.error("Failed to parse recipe JSON", e);
+                }
+            }
+
+            // Handle if the recipe is nested under a 'recipe' key
+            if (recipe.recipe) recipe = recipe.recipe;
+
+            document.getElementById('resultsTitle').textContent = recipe.recipe_name || 'Generated Recipe';
+
+            // Show header for recipes
+            const header = document.querySelector('.results-header');
+            if (header) header.style.display = 'flex';
 
             const badge = document.getElementById('safetyBadge');
             badge.className = 'safety-badge safe';
             badge.textContent = '✓ Safe Recipe';
 
+            // Safe access to arrays
+            const ingredients = Array.isArray(recipe.ingredients) ? recipe.ingredients : [];
+            const instructions = Array.isArray(recipe.instructions) ? recipe.instructions : [];
+
             content.innerHTML = `
                 <div class="recipe-card">
                     <h4>Ingredients</h4>
                     <ul>
-                        ${(data.ingredients || []).map(i => `<li>${i}</li>`).join('')}
+                        ${ingredients.map(i => `<li>${i}</li>`).join('')}
                     </ul>
                     <h4>Instructions</h4>
                     <ol>
-                        ${(data.instructions || []).map(i => `<li>${i}</li>`).join('')}
+                        ${instructions.map(i => `<li>${i}</li>`).join('')}
                     </ol>
-                    ${data.nutrition ? `
+                    ${recipe.nutrition ? `
                         <h4 style="margin-top: 16px;">Estimated Nutrition</h4>
-                        <p>Calories: ${data.nutrition.calories} | Protein: ${data.nutrition.protein_g}g | Carbs: ${data.nutrition.carbs_g}g</p>
+                        <p>Calories: ${recipe.nutrition.calories || '--'} | Protein: ${recipe.nutrition.protein_g || '--'}g | Carbs: ${recipe.nutrition.carbs_g || '--'}g</p>
                     ` : ''}
                 </div>
             `;
