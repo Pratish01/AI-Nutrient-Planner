@@ -7,10 +7,14 @@ python-dotenv>=1.0.0
 # Database
 sqlalchemy>=2.0.0
 
-# OCR (choose one - EasyOCR recommended for local)
-# easyocr>=1.7.0        # Uncomment when ready to use
-# pytesseract>=0.3.10   # Alternative: requires Tesseract installation
-Pillow>=10.0.0          # Image processing
+# OCR
+easyocr>=1.7.0
+paddleocr>=2.7.0
+paddlepaddle>=2.5.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+pdf2image>=1.16.3
+pypdf>=3.17.0
 
 # LLM (Ollama via HTTP)
 requests>=2.31.0

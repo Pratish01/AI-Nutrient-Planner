@@ -306,171 +306,273 @@ KNOWN_ALLERGENS = [
 def parse_medical_report(file_path: str) -> dict:
     """
     Parse a medical report file and extract conditions and allergens.
-    
-    Uses OCR (pytesseract if available) to extract text,
-    then pattern matching to identify medical conditions and allergens.
-    
-    Args:
-        file_path: Path to the medical report (PDF or image)
-        
-    Returns:
-        dict with:
-            - raw_text: The extracted OCR text
-            - conditions: List of detected medical conditions
-            - allergens: List of detected allergens
+    Strategy: 
+    1. Try digital text (PDF only)
+    2. Try extracting images from PDF -> OCR
+    3. Try full PDF conversion -> OCR
+    4. Direct Image OCR
     """
+    import os
     print(f"[OCR] Parsing medical report: {file_path}")
     
-    raw_text = ""
+    raw_text = "--- OCR DEBUG LOG ---\n"
     conditions = []
     allergens = []
     
-    try:
-        # Try to use pytesseract for OCR
-        import pytesseract
-        from PIL import Image
-        
-        # Configure Tesseract path for Windows
-        import os
-        tesseract_paths = [
-            r'C:\Program Files\Tesseract-OCR\tesseract.exe',
-            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
-            r'C:\Users\hp\AppData\Local\Tesseract-OCR\tesseract.exe',
-        ]
-        for path in tesseract_paths:
-            if os.path.exists(path):
-                pytesseract.pytesseract.tesseract_cmd = path
-                print(f"[OCR] Using Tesseract: {path}")
-                break
-        else:
-            print("[OCR] Tesseract not found in common paths - using system PATH")
-        
-        # Handle PDF vs image
-        if file_path.lower().endswith('.pdf'):
-            # Try pdf2image for PDF
-            try:
-                from pdf2image import convert_from_path
-                pages = convert_from_path(file_path)
-                for page in pages:
-                    raw_text += pytesseract.image_to_string(page) + "\n"
-            except ImportError:
-                print("[OCR] pdf2image not installed, cannot process PDF")
-                raw_text = f"PDF file: {file_path} (pdf2image not installed)"
-        else:
-            # Process image
-            img = Image.open(file_path)
-            raw_text = pytesseract.image_to_string(img)
-        
-        print(f"[OCR] Extracted {len(raw_text)} characters")
-        print(f"[OCR] Text sample (first 500 chars):\n{raw_text[:500]}")
-        
-    except ImportError:
-        print("[OCR] pytesseract not installed, using filename heuristics")
-        # Fallback: try to extract info from filename
-        raw_text = f"File: {file_path}"
-    except Exception as e:
-        print(f"[OCR] Error: {e}")
-        raw_text = f"Error processing file: {e}"
+    # 0. Setup OCR Engines (Global state or per-call)
+    # We try in order: PaddleOCR, EasyOCR, Tesseract
     
-    # Extract conditions from text
+    ocr_engines = [] # List of initialized engines
+    
+    # 1. PaddleOCR Attempt
+    try:
+        from paddleocr import PaddleOCR
+        print("[OCR] Initializing PaddleOCR...")
+        paddle_ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+        ocr_engines.append(("paddle", paddle_ocr))
+        raw_text += "[Info] PaddleOCR initialized.\n"
+    except Exception as e:
+        raw_text += f"[Warning] PaddleOCR failed to init: {e}\n"
+    
+    # 2. EasyOCR Attempt
+    try:
+        import easyocr
+        print("[OCR] Initializing EasyOCR...")
+        easy_ocr_reader = easyocr.Reader(['en'], gpu=False) # GPU False for stability if not sure
+        ocr_engines.append(("easyocr", easy_ocr_reader))
+        raw_text += "[Info] EasyOCR initialized.\n"
+    except Exception as e:
+        raw_text += f"[Warning] EasyOCR failed to init: {e}\n"
+
+    # 3. Tesseract Setup
+    import pytesseract
+    from PIL import Image
+    tesseract_available = False
+    tesseract_paths = [
+        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+        r'C:\Users\hp\AppData\Local\Tesseract-OCR\tesseract.exe',
+    ]
+    for path in tesseract_paths:
+        if os.path.exists(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            raw_text += f"[Info] Tesseract found at: {path}\n"
+            tesseract_available = True
+            break
+    
+    if not tesseract_available:
+        raw_text += "[Warning] Tesseract not found in common paths.\n"
+    else:
+        ocr_engines.append(("tesseract", pytesseract))
+
+    if not ocr_engines:
+        raw_text += "[Critical] No OCR engines available!\n"
+
+    def run_multi_ocr(img_pil):
+        """Internal helper to run best available OCR on an image."""
+        import numpy as np
+        
+        for engine_type, engine in ocr_engines:
+            try:
+                if engine_type == "paddle":
+                    res = engine.ocr(np.array(img_pil), cls=True)
+                    if res and res[0]:
+                        return "\n".join([line[1][0] for line in res[0]])
+                elif engine_type == "easyocr":
+                    res = engine.readtext(np.array(img_pil), detail=0)
+                    if res:
+                        return "\n".join(res)
+                elif engine_type == "tesseract":
+                    return engine.image_to_string(img_pil)
+            except Exception as e:
+                print(f"[OCR] Engine {engine_type} failed during processing: {e}")
+        return ""
+
+    try:
+        if file_path.lower().endswith('.pdf'):
+            raw_text += "[Info] Detected PDF file format.\n"
+            import pypdf
+            reader = pypdf.PdfReader(file_path)
+            
+            # 1. Digital Text
+            digital_text = ""
+            for i, page in enumerate(reader.pages):
+                txt = page.extract_text()
+                if txt: digital_text += txt + "\n"
+            
+            if len(digital_text.strip()) > 50:
+                raw_text += f"[Success] Extracted {len(digital_text)} chars from digital layer.\n"
+                raw_text += digital_text
+                extracted_success = True
+            else:
+                raw_text += "[Info] No digital text found, scanning for images...\n"
+                
+                # 2. Embedded Images
+                img_extracted_text = ""
+                for i, page in enumerate(reader.pages):
+                    for img_obj in page.images:
+                        try:
+                            import io
+                            img = Image.open(io.BytesIO(img_obj.data))
+                            txt = run_multi_ocr(img)
+                            if txt: img_extracted_text += txt + "\n"
+                        except Exception as e:
+                            raw_text += f"[Error] Image on page {i+1} skip: {e}\n"
+                
+                if img_extracted_text.strip():
+                    raw_text += "[Success] Extracted text from embedded PDF images.\n"
+                    raw_text += img_extracted_text
+                    extracted_success = True
+                else:
+                    # 3. Full Page conversion (Requires Poppler)
+                    raw_text += "[Info] No embedded images found, trying full page conversion...\n"
+                    try:
+                        from pdf2image import convert_from_path
+                        pages = convert_from_path(file_path)
+                        for page_img in pages:
+                            txt = run_multi_ocr(page_img)
+                            if txt: raw_text += txt + "\n"
+                        extracted_success = True
+                    except Exception as e:
+                        raw_text += f"[Error] pdf2image failed (likely missing poppler): {e}\n"
+
+        else: # Image file
+            raw_text += "[Info] Detected Image file format.\n"
+            img = Image.open(file_path)
+            txt = run_multi_ocr(img)
+            
+            if txt:
+                raw_text += txt
+                extracted_success = True
+            else:
+                raw_text += "[Error] Failed to extract any text from image.\n"
+
+    except Exception as e:
+        raw_text += f"[Critical] Error in OCR pipeline: {e}\n"
+
+    print(f"[OCR] Extracted {len(raw_text)} chars. Preview: {raw_text[:500]}...")
+
+    # Pattern Matching (Improved with word boundaries and bi-directional negation detection)
     text_lower = raw_text.lower()
+    NEGATIONS = ["no", "none", "negative", "not", "without", "denies", "denied", "absent"]
     
     for condition in KNOWN_CONDITIONS:
-        if condition in text_lower:
-            # Normalize condition name
-            normalized = condition.replace("type 1 diabetes", "Type 1 Diabetes")
-            normalized = normalized.replace("type 2 diabetes", "Type 2 Diabetes") 
-            normalized = normalized.replace("diabetic", "Diabetes")
-            normalized = normalized.replace("diabetes", "Diabetes")
-            normalized = normalized.replace("hypertension", "Hypertension")
-            normalized = normalized.replace("high blood pressure", "Hypertension")
-            normalized = normalized.replace("kidney disease", "Kidney Disease")
-            normalized = normalized.replace("heart disease", "Heart Disease")
-            normalized = normalized.replace("thyroid", "Thyroid Disorder")
-            normalized = normalized.replace("cholesterol", "High Cholesterol")
-            normalized = normalized.replace("obesity", "Obesity")
-            normalized = normalized.replace("anemia", "Anemia")
+        # Use word boundaries for precise matching
+        pattern = r'\b' + re.escape(condition) + r'\b'
+        matches = list(re.finditer(pattern, text_lower))
+        
+        for match in matches:
+            start = match.start()
+            end = match.end()
             
-            # Only add if not already present
-            if normalized.title() not in conditions:
-                conditions.append(normalized.title())
-    
-    # Extract allergens from text
+            # 1. Look back 40 characters for negations
+            prefix = text_lower[max(0, start-40):start]
+            # 2. Look ahead 20 characters for negations like ": no" or "- negative"
+            suffix = text_lower[end:min(len(text_lower), end+20)]
+            
+            is_negated = False
+            for neg in NEGATIONS:
+                neg_pattern = r'\b' + re.escape(neg) + r'\b'
+                if re.search(neg_pattern, prefix) or re.search(neg_pattern, suffix):
+                    is_negated = True
+                    break
+            
+            if not is_negated:
+                # Normalize
+                normalized = condition.replace("type 1 diabetes", "Type 1 Diabetes").replace("type 2 diabetes", "Type 2 Diabetes")
+                normalized = normalized.replace("diabetic", "Diabetes").replace("diabetes", "Diabetes")
+                normalized = normalized.replace("hypertension", "Hypertension").replace("high blood pressure", "Hypertension")
+                
+                cond_title = normalized.title()
+                if cond_title not in conditions:
+                    conditions.append(cond_title)
+                break
+
     for allergen in KNOWN_ALLERGENS:
-        if allergen in text_lower:
-            # Normalize allergen name
+        pattern = r'\b' + re.escape(allergen) + r'\b'
+        if re.search(pattern, text_lower):
             normalized = allergen.title()
-            if "peanut" in allergen:
-                normalized = "Peanuts"
-            elif "nut" in allergen:
-                normalized = "Tree Nuts"
-            elif "milk" in allergen or "dairy" in allergen:
-                normalized = "Dairy"
-            elif "egg" in allergen:
-                normalized = "Eggs"
-            elif "wheat" in allergen or "gluten" in allergen:
-                normalized = "Gluten"
-            elif "fish" in allergen or "shellfish" in allergen:
-                normalized = "Seafood"
-            elif "soy" in allergen:
-                normalized = "Soy"
-            
-            if normalized not in allergens:
-                allergens.append(normalized)
-    
-    print(f"[OCR] Found conditions: {conditions}")
-    print(f"[OCR] Found allergens: {allergens}")
-    
-    # =================================================================
-    # EXTRACT VITALS (Glucose Level, Cholesterol)
-    # =================================================================
+            if "peanut" in allergen: normalized = "Peanuts"
+            elif "nut" in allergen: normalized = "Tree Nuts"
+            elif "milk" in allergen or "dairy" in allergen: normalized = "Dairy"
+            if normalized not in allergens: allergens.append(normalized)
+
     vitals = {}
+    biometrics = {}
     
-    # Glucose level patterns - more flexible to match various formats
-    # Matches: "Glucose fasting (PHO) 83 mg/dl", "Glucose: 83", "Blood Sugar 126 mg/dL"
-    glucose_patterns = [
-        r'glucose\s*(?:fasting|level)?[^0-9]*(\d{2,3}(?:\.\d)?)\s*(?:mg/?dl)?',
-        r'(?:blood\s*sugar|fbs|rbs|ppbs)[^0-9]*(\d{2,3}(?:\.\d)?)',
-        r'(\d{2,3})\s*mg/?dl[^0-9]*glucose',
+    # 1. Glucose & HbA1c
+    match_gl = re.search(r'(?:glucose|fasting glucose|sugar)[^0-9]*(\d{1,3}\.?\d?)', text_lower)
+    if match_gl: vitals["glucose_level"] = float(match_gl.group(1))
+    
+    match_hba1c = re.search(r'hba1c[^0-9]*(\d{1,2}\.?\d?)', text_lower)
+    if match_hba1c: vitals["hba1c"] = float(match_hba1c.group(1))
+    
+    # 2. Blood Pressure
+    match_bp = re.search(r'bp[^0-9]*(\d{2,3})[/\s]*(\d{2,3})', text_lower)
+    if match_bp:
+        vitals["systolic_bp"] = float(match_bp.group(1))
+        vitals["diastolic_bp"] = float(match_bp.group(2))
+    
+    # 3. Lipid Profile (Cholesterol, Triglycerides, HDL, LDL)
+    match_ch = re.search(r'cholesterol[^0-9]*(\d{2,4}\.?\d?)', text_lower)
+    if match_ch: vitals["cholesterol"] = float(match_ch.group(1))
+    
+    match_tg = re.search(r'triglycerides[^0-9]*(\d{1,4}\.?\d?)', text_lower)
+    if match_tg: vitals["triglycerides"] = float(match_tg.group(1))
+    
+    match_hdl = re.search(r'hdl[^0-9]*(\d{1,3}\.?\d?)', text_lower)
+    if match_hdl: vitals["hdl"] = float(match_hdl.group(1))
+    
+    match_ldl = re.search(r'ldl[^0-9]*(\d{1,3}\.?\d?)', text_lower)
+    if match_ldl: vitals["ldl"] = float(match_ldl.group(1))
+
+    # 4. Biometrics
+    match_age = re.search(r'\bage\b[^0-9]*(\d{1,2})', text_lower)
+    if match_age: 
+        biometrics["age"] = int(match_age.group(1))
+    else:
+        # Try finding Date of Birth (e.g., 01.01.1973)
+        match_dob = re.search(r'(?:dob|birth)[^0-9]*(\d{2}[\./-]\d{2}[\./-]\d{4})', text_lower)
+        if match_dob:
+            try:
+                from datetime import datetime
+                dob_str = match_dob.group(1).replace('.', '-').replace('/', '-')
+                dob = datetime.strptime(dob_str, "%d-%m-%Y")
+                age = datetime.now().year - dob.year
+                biometrics["age"] = age
+            except:
+                pass
+
+    match_weight = re.search(r'weight[^0-9]*(\d{2,3})', text_lower)
+    if match_weight: biometrics["weight_kg"] = float(match_weight.group(1))
+    
+    match_height = re.search(r'height[^0-9]*(\d{2,3})', text_lower)
+    if match_height: biometrics["height_cm"] = float(match_height.group(1))
+    
+    if "female" in text_lower: biometrics["gender"] = "female"
+    elif "male" in text_lower: biometrics["gender"] = "male"
+
+    # 5. Medications
+    medications = []
+    common_meds = [
+        "metformin", "insulin", "atorvastatin", "amlodipine", "losartan",
+        "levothyroxine", "lisinopril", "gabapentin", "metoprolol", "albuterol",
+        "paracetamol", "ibuprofen", "aspirin", "omeprazole", "glimepiride",
+        "sitagliptin", "telmisartan", "rosuvastatin", "vildagliptin"
     ]
     
-    for pattern in glucose_patterns:
-        matches = re.findall(pattern, text_lower, re.IGNORECASE)
-        if matches:
-            try:
-                value = float(matches[0])
-                if 40 <= value <= 400:  # Valid glucose range
-                    vitals["glucose_level"] = value
-                    print(f"[OCR] Found glucose level: {value}")
-                    break
-            except ValueError:
-                pass
-    
-    # Cholesterol patterns - more flexible
-    # Matches: "Cholesterol, total (PHO) 221 mg/dl", "Total Cholesterol: 200"
-    cholesterol_patterns = [
-        r'cholesterol[,\s]*(?:total)?[^0-9]*(\d{2,3}(?:\.\d)?)\s*(?:mg/?dl)?',
-        r'(?:total\s*cholesterol|chol)[^0-9]*(\d{2,3}(?:\.\d)?)',
-        r'(\d{2,3})\s*mg/?dl[^0-9]*cholesterol',
-    ]
-    
-    for pattern in cholesterol_patterns:
-        matches = re.findall(pattern, text_lower, re.IGNORECASE)
-        if matches:
-            try:
-                value = float(matches[0])
-                if 50 <= value <= 400:  # Valid cholesterol range
-                    vitals["cholesterol"] = value
-                    print(f"[OCR] Found cholesterol: {value}")
-                    break
-            except ValueError:
-                pass
-    
-    print(f"[OCR] Found vitals: {vitals}")
-    
+    for med in common_meds:
+        pattern = r'\b' + re.escape(med) + r'\b'
+        if re.search(pattern, text_lower):
+            med_title = med.title()
+            if med_title not in medications:
+                medications.append(med_title)
+
     return {
         "raw_text": raw_text,
         "conditions": conditions,
         "allergens": allergens,
         "vitals": vitals,
+        "biometrics": biometrics,
+        "medications": medications
     }

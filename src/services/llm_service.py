@@ -93,7 +93,43 @@ SCHEMA:
 
 Rules:
 - Respect all health conditions and allergens.
-- Use simple, accessible ingredients."""
+- Use simple, accessible ingredients.""",
+
+        "medical_parser": """You are a medical data extraction assistant.
+Extract the following information from the provided medical report text into a JSON object.
+
+IMPORTANT: YOUR RESPONSE MUST BE ONLY A RAW JSON OBJECT. NO MARKDOWN.
+
+SCHEMA:
+{
+  "conditions": [],
+  "allergens": [],
+  "medications": [],
+  "vitals": {
+    "glucose_level": null,
+    "cholesterol": null,
+    "hba1c": null,
+    "systolic_bp": null,
+    "diastolic_bp": null
+  },
+  "biometrics": {
+    "age": null,
+    "gender": null,
+    "weight_kg": null,
+    "height_cm": null
+  }
+}
+
+Rules:
+- "conditions": List distinct diagnosed medical conditions found (e.g., "Type 2 Diabetes").
+- "allergens": List foods or substances the patient is allergic to.
+- "medications": List names of prescribed medications (e.g., "Metformin").
+- "vitals": Extract numeric values for Glucose, Cholesterol (Total, HDL, LDL, Triglycerides), HbA1c, and Blood Pressure.
+- "biometrics": Extract Age (years), Gender (male/female), Weight (kg), and Height (cm).
+- If nothing is found in a category, return an empty list or null values.
+- IMPORTANT: If you see a test name (e.g., "Glucose fasting") followed by a number, that number is the value.
+- Be precise. Do not hallucinate information not in the text.
+"""
     }
     
     def __init__(
@@ -338,6 +374,23 @@ Be specific and practical."""
         prompt += "Ensure it is safe given the user's health profile."
         
         return self.chat(prompt, system_prompt="recipe_creator", context=context)
+
+    def parse_medical_report(self, raw_text: str) -> LLMResponse:
+        """
+        Extract structured data from raw medical report text.
+        """
+        # Truncate text if too long to fit context window
+        max_chars = 10000
+        text_segment = raw_text[:max_chars] + ("..." if len(raw_text) > max_chars else "")
+        
+        prompt = f"""Analyze this medical report text and extract proper diagnosis and vitals:
+
+---
+{text_segment}
+---"""
+        
+        return self.chat(prompt, system_prompt="medical_parser")
+
 
 
 # Global singleton instance

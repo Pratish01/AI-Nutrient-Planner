@@ -1165,12 +1165,66 @@ async def upload_medical_report(
         except:
             pass
         
-        print(f"[MEDICAL REPORT] Conditions: {result.get('conditions', [])}")
-        print(f"[MEDICAL REPORT] Allergens: {result.get('allergens', [])}")
-        print(f"[MEDICAL REPORT] Vitals: {result.get('vitals', {})}")
+        print(f"[MEDICAL REPORT] Conditions (Regex): {result.get('conditions', [])}")
+        print(f"[MEDICAL REPORT] Vitals (Regex): {result.get('vitals', {})}")
+        
+        # Enhanced LLM Parsing
+        from services.llm_service import get_llm_service
+        llm = get_llm_service()
+        
+        # Initialize lists with regex results
+        final_conditions = result.get('conditions', [])
+        final_allergens = result.get('allergens', [])
+        final_vitals = result.get('vitals', {})
+        final_biometrics = result.get('biometrics', {})
+        final_medications = result.get('medications', [])
+        
+        if llm.is_available and result.get('raw_text'):
+            print("[MEDICAL REPORT] 🧠 Analyzing text with AI...")
+            llm_response = llm.parse_medical_report(result['raw_text'])
+            
+            if llm_response.success:
+                try:
+                    import json
+                    import re
+                    
+                    # Clean JSON parsing
+                    content = llm_response.content.strip()
+                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                    if json_match:
+                        content = json_match.group(0)
+                    
+                    ai_data = json.loads(content)
+                    print(f"[MEDICAL REPORT] AI Data: {ai_data}")
+                    
+                    # Merge structured data
+                    if ai_data.get('conditions'):
+                        # Union of regex and AI conditions
+                        final_conditions = list(set(final_conditions + ai_data['conditions']))
+                        
+                    if ai_data.get('allergens'):
+                        final_allergens = list(set(final_allergens + ai_data['allergens']))
+                    
+                    if ai_data.get('medications'):
+                        final_medications = list(set(final_medications + ai_data['medications']))
+                        
+                    # Update vitals (AI overrides regex if present and non-zero)
+                    if ai_data.get('vitals'):
+                        for k, v in ai_data['vitals'].items():
+                            if v is not None and v != 0:
+                                final_vitals[k] = v
+                    
+                    # Update biometrics
+                    if ai_data.get('biometrics'):
+                        for k, v in ai_data['biometrics'].items():
+                            if v is not None:
+                                final_biometrics[k] = v
+                                
+                except Exception as e:
+                    print(f"[MEDICAL REPORT] AI parsing failed: {e}")
         
         # Build daily_targets with vitals
-        daily_targets = result.get('vitals', {})
+        daily_targets = final_vitals
         
         # Save to database
         import uuid
@@ -1179,12 +1233,13 @@ async def upload_medical_report(
         MedicalProfileRepository.create(
             profile_id=profile_id,
             user_id=user_id,
-            conditions=result.get('conditions', []),
-            allergens=result.get('allergens', []),
-            medications=[],
+            conditions=final_conditions,
+            allergens=final_allergens,
+            medications=final_medications,
             daily_targets=daily_targets,  # Contains vitals
             raw_ocr_text=result.get('raw_text', '')[:5000],  # Limit size
             source_file=file.filename,
+            **final_biometrics
         )
         
         print(f"[MEDICAL REPORT] ✓ Saved profile: {profile_id}")
@@ -1192,10 +1247,20 @@ async def upload_medical_report(
         return {
             "success": True,
             "profile_id": profile_id,
-            "conditions": result.get('conditions', []),
-            "allergens": result.get('allergens', []),
-            "vitals": result.get('vitals', {}),
-            "message": f"Extracted {len(result.get('conditions', []))} conditions, {len(result.get('allergens', []))} allergens, and vitals from report."
+            "profile": {  # Frontend expects 'profile' key for immediate display
+                "conditions": final_conditions,
+                "allergens": final_allergens,
+                "vitals": final_vitals,
+                "biometrics": final_biometrics,
+                "medications": final_medications
+            },
+            "conditions": final_conditions,
+            "allergens": final_allergens,
+            "vitals": final_vitals,
+            "biometrics": final_biometrics,
+            "medications": final_medications,
+            "debug_text": result.get('raw_text', '')[:2000],  # Return first 2000 chars for debug
+            "message": f"Analyzed report. Found {len(final_conditions)} conditions and {len(final_vitals)} vitals."
         }
         
     except Exception as e:
