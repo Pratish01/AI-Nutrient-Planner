@@ -892,19 +892,34 @@
                 </div>
             `;
 
-            // Violations
+            // Violations & Tips
             const violationsSection = document.getElementById('violationsSection');
             const violations = data.safety?.violations || [];
+            let html = '';
+
+            if (nutrition.calories === 0) {
+                html += `
+                    <div style="background: #e0f2fe; border-left: 4px solid #0ea5e9; padding: 16px; border-radius: 8px; margin-bottom: 20px;">
+                        <div style="display: flex; gap: 12px; align-items: flex-start;">
+                            <span style="font-size: 20px;">💡</span>
+                            <div>
+                                <strong style="color: #0369a1; display: block; margin-bottom: 4px;">Search Tip</strong>
+                                <p style="color: #0c4a6e; font-size: 13px;">Dish recognized but nutrition data is missing. Try 'Ask AI Coach' for an estimate or use name for manual correction.</p>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
             if (violations.length > 0) {
-                violationsSection.innerHTML = '<h4 style="margin-bottom: 12px;">⚠️ Warnings</h4>' +
+                html += '<h4 style="margin-bottom: 12px;">⚠️ Warnings</h4>' +
                     violations.map(v => `
                         <div class="violation-card ${v.severity === 'block' ? 'danger' : ''}">
                             <strong>${v.rule_id}</strong>: ${v.message}
                         </div>
                     `).join('');
-            } else {
-                violationsSection.innerHTML = '';
             }
+            violationsSection.innerHTML = html;
 
             // Store for coach
             localStorage.setItem('lastFoodScan', JSON.stringify(data));

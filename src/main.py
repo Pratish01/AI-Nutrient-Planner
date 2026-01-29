@@ -1431,11 +1431,18 @@ async def get_medical_profile(user: dict = Depends(get_current_user)):
         response.update(profile_obj.to_dict())
         response['daily_targets'] = asdict(profile_obj.daily_targets) if hasattr(profile_obj.daily_targets, '__dataclass_fields__') else profile_obj.daily_targets.__dict__
         
+        # Calculate BMI
+        bmi = None
+        if profile_obj.weight_kg and profile_obj.height_cm:
+            h = profile_obj.height_cm / 100
+            bmi = round(profile_obj.weight_kg / (h * h), 1)
+
         # Ensure bio_metrics block exists for frontend (crucial for dashboard.html)
         response['bio_metrics'] = {
             "age": profile_obj.age,
             "weight_kg": profile_obj.weight_kg,
             "height_cm": profile_obj.height_cm,
+            "bmi": bmi,
             "activity_level": profile_obj.activity_level.value if hasattr(profile_obj.activity_level, 'value') else str(profile_obj.activity_level),
             "fitness_goal": profile_obj.fitness_goal,
             "gender": profile_obj.gender or "male"
@@ -1445,6 +1452,14 @@ async def get_medical_profile(user: dict = Depends(get_current_user)):
 
     except Exception as e:
         print(f"[PROFILE] Error calculating dynamic targets: {e}")
+        # Build minimal bio_metrics even on error if possible
+        if raw_profile:
+            raw_profile['bio_metrics'] = {
+                "age": raw_profile.get('age'),
+                "weight_kg": raw_profile.get('weight_kg'),
+                "height_cm": raw_profile.get('height_cm'),
+                "gender": raw_profile.get('gender', 'male')
+            }
         return raw_profile
 
 
@@ -1741,29 +1756,32 @@ async def upload_food_image(
                 print(f"[FOOD UPLOAD] ✓ Top Match: {final_food_name} ({final_confidence:.3f})")
                 
                 # Get nutrition if available
-                # 1. Try exact match in local CSV database
-                lookup = FOOD_DATABASE.get(final_food_name.lower())
+                # 1. Try exact/fuzzy match in global registry (Central source)
+                from services.nutrition_registry import get_nutrition_registry
+                registry = get_nutrition_registry()
+                lookup = registry.get_by_name(final_food_name)
                 
-                # 2. Try registry (fuzzy matching) if local lookup failed
+                # 2. Try match in local CSV database (Backward compatibility)
                 if not lookup:
-                    from services.nutrition_registry import get_nutrition_registry
-                    nutrition_registry = get_nutrition_registry()
-                    if nutrition_registry:
-                        lookup = nutrition_registry.get_by_name(final_food_name)
+                    lookup = FOOD_DATABASE.get(final_food_name.lower())
                 
-                # 3. Keyword fallback if still no lookup
+                # 3. Keyword/Recursive fallback
                 if not lookup:
-                    keywords = ['dal', 'curry', 'roti', 'paratha', 'rice', 'sandwich', 'pasta', 'salad', 'samosa', 'paneer', 'chicken', 'kebab', 'tikka', 'poha', 'vada', 'burger', 'pizza']
-                    for kw in keywords:
-                        if kw in final_food_name.lower() and kw in FOOD_DATABASE:
-                            lookup = FOOD_DATABASE[kw]
-                            print(f"[FOOD UPLOAD] ⚠ Falling back to keyword match: {kw}")
-                            break
+                    # Generic keyword fallback for common dish types
+                    common_keywords = ['dal', 'curry', 'roti', 'paratha', 'rice', 'sandwich', 'pasta', 'salad', 'samosa', 'paneer', 'chicken', 'kebab', 'tikka', 'poha', 'vada', 'burger', 'pizza', 'dosa', 'idli']
+                    name_lower = final_food_name.lower()
+                    for kw in common_keywords:
+                        if kw in name_lower:
+                            # Try registry again with just the keyword
+                            lookup = registry.get_by_name(kw) or FOOD_DATABASE.get(kw)
+                            if lookup:
+                                print(f"[FOOD UPLOAD] ⚠ Falling back to keyword match: {kw}")
+                                break
 
                 nutrition = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "sugar_g": 0, "fiber_g": 0, "sodium_mg": 0}
                 if lookup:
                     nutrition = lookup
-                    print(f"[FOOD UPLOAD] ✓ Nutrition found for {final_food_name}")
+                    print(f"[FOOD UPLOAD] ✓ Nutrition found for {final_food_name}: {nutrition.get('calories')} kcal")
                 else:
                     print(f"[FOOD UPLOAD] ❌ No nutrition found for {final_food_name}")
 
@@ -2182,30 +2200,82 @@ async def generate_recipe(
 @app.get("/api/analytics/summary")
 async def get_analytics_summary(user: dict = Depends(get_current_user)):
     """
-    Get analytics summary for user.
+    Get dynamic analytics summary for user based on actual logs.
     """
-    # Demo analytics data
+    user_id = user["sub"]
+    
+    # Get today's stats
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_stats = DailyLogRepository.get_or_create(user_id, today_str)
+    
+    # Get last 7 days stats for weekly totals and trends
+    weekly_logs = []
+    end_date = datetime.now()
+    for i in range(7):
+        date_str = (end_date - timedelta(days=i)).strftime("%Y-%m-%d")
+        log = DailyLogRepository.get_or_create(user_id, date_str)
+        weekly_logs.append(log)
+    
+    # Calculate Weekly Metrics
+    total_actual_cals = sum(l.get("calories_consumed", 0) for l in weekly_logs)
+    total_target_cals = sum(l.get("calories_target", 2000) for l in weekly_logs)
+    
+    # Health Score Calculation (Simplified)
+    # Start with 100 and deduct for missed targets or imbalances
+    adherence_penalty = 0
+    days_with_logs = 0
+    for log in weekly_logs:
+        if log.get("calories_consumed", 0) > 0:
+            days_with_logs += 1
+            target = log.get("calories_target", 2000)
+            dev = abs(log["calories_consumed"] - target) / target
+            adherence_penalty += dev * 20 # Max 20 points penalty per day for 100% deviation
+            
+    avg_penalty = adherence_penalty / days_with_logs if days_with_logs > 0 else 25
+    health_score = max(0, min(100, int(100 - avg_penalty)))
+    
+    # Grade mapping
+    if health_score >= 90: grade = "A+"
+    elif health_score >= 80: grade = "A"
+    elif health_score >= 70: grade = "B"
+    elif health_score >= 60: grade = "C"
+    else: grade = "D"
+    
+    # Macro Balance (Based on Today)
+    p = today_stats.get("protein_g", 0) * 4
+    c = today_stats.get("carbs_g", 0) * 4
+    f = today_stats.get("fat_g", 0) * 9
+    total_macro_kcal = (p + c + f) or 1
+    
+    # Trends (Comparing last 3 days to previous 4 days)
+    recent_avg = sum(l.get("calories_consumed", 0) for l in weekly_logs[:3]) / 3
+    older_avg = sum(l.get("calories_consumed", 0) for l in weekly_logs[3:]) / 4
+    
+    cal_trend = "stable"
+    if recent_avg < older_avg * 0.9: cal_trend = "decreasing"
+    elif recent_avg > older_avg * 1.1: cal_trend = "increasing"
+
     return {
-        "health_score": 72,
-        "health_grade": "B",
+        "health_score": health_score,
+        "health_grade": grade,
         "weekly_calories": {
-            "target": 14000,
-            "actual": 12500,
-            "status": "good"
+            "target": int(total_target_cals),
+            "actual": int(total_actual_cals),
+            "status": "good" if total_actual_cals <= total_target_cals * 1.05 else "over"
         },
         "macro_balance": {
-            "protein": {"target": 25, "actual": 22},
-            "carbs": {"target": 50, "actual": 55},
-            "fat": {"target": 25, "actual": 23}
+            "protein": {"target": 25, "actual": int(p / total_macro_kcal * 100)},
+            "carbs": {"target": 50, "actual": int(c / total_macro_kcal * 100)},
+            "fat": {"target": 25, "actual": int(f / total_macro_kcal * 100)}
         },
         "streaks": {
-            "logging": 5,
-            "safe_meals": 12
+            "logging": days_with_logs,
+            "safe_meals": max(0, days_with_logs * 2 - 1) # Approximation
         },
         "trends": {
-            "calories": "decreasing",
+            "calories": cal_trend,
             "protein": "stable",
-            "sugar": "decreasing"
+            "sugar": "decreasing" if health_score > 75 else "stable"
         }
     }
 

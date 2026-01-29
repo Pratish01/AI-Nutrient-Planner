@@ -225,13 +225,17 @@ class MedicalProfileRepository:
     
     @staticmethod
     def get_by_user_id(user_id: str) -> Optional[Dict[str, Any]]:
-        """Get medical profile for a user."""
+        """Get medical profile for a user, including name from users table."""
         with get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT * FROM medical_profiles WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
-                (user_id,)
-            )
+            cursor.execute("""
+                SELECT mp.*, u.name 
+                FROM medical_profiles mp
+                JOIN users u ON mp.user_id = u.id
+                WHERE mp.user_id = ? 
+                ORDER BY mp.created_at DESC 
+                LIMIT 1
+            """, (user_id,))
             row = cursor.fetchone()
             if row:
                 profile = dict(row)
