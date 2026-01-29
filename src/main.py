@@ -281,7 +281,7 @@ def get_user_profile_for_rules(user_id: str) -> UserProfile:
         gender=db_profile.get("gender"),
         weight_kg=db_profile.get("weight_kg"),
         height_cm=db_profile.get("height_cm"),
-        activity_level=ActivityLevel(db_profile.get("activity_level", "moderately_active")),
+        activity_level=ActivityLevel(db_profile.get("activity_level") or "moderately_active"),
         fitness_goal=db_profile.get("fitness_goal"),
     )
     
@@ -1081,64 +1081,6 @@ async def submit_feedback(request: FeedbackRequest, user: dict = Depends(get_cur
 # ROUTES: USER
 # =============================================================================
 
-@app.get("/api/profile")
-async def get_profile(user: dict = Depends(get_current_user)):
-    """
-    Get current user's medical profile from database.
-    """
-    user_id = user["sub"]
-    print(f"[API] Loading profile for user: {user_id}")
-    
-    # Get profile from database (from OCR extraction)
-    profile = MedicalProfileRepository.get_by_user_id(user_id)
-    
-    if not profile:
-        print(f"[API] No profile found for user: {user_id}")
-        # Return empty profile instead of 404
-        return {
-            "user_id": user_id,
-            "conditions": [],
-            "allergies": [],
-            "medications": [],
-            "daily_targets": {},
-            "vitals": {
-                "glucose_level": None,
-                "cholesterol": None
-            },
-            "source": "none",
-            "message": "No medical profile yet. Upload a report."
-        }
-    
-    print(f"[API] Found profile: conditions={profile.get('conditions')}, allergens={profile.get('allergens')}")
-    
-    # Extract vitals from daily_targets if available
-    daily_targets = profile.get("daily_targets", {})
-    vitals = {
-        "glucose_level": daily_targets.get("glucose_level") or daily_targets.get("sugar_level"),
-        "cholesterol": daily_targets.get("cholesterol"),
-    }
-    
-    return {
-        "user_id": user_id,
-        "conditions": profile.get("conditions", []),
-        "allergies": profile.get("allergens", []),
-        "medications": profile.get("medications", []),
-        "daily_targets": daily_targets,
-        "vitals": vitals,
-        "source": "medical_report_ocr",
-        "source_file": profile.get("source_file"),
-        "created_at": profile.get("created_at"),
-        "bio_metrics": {
-            "age": profile.get("age"),
-            "gender": profile.get("gender"),
-            "weight_kg": profile.get("weight_kg"),
-            "height_cm": profile.get("height_cm"),
-            "activity_level": profile.get("activity_level"),
-            "fitness_goal": profile.get("fitness_goal"),
-        }
-    }
-
-
 # Keep old endpoint for backward compatibility
 @app.get("/api/user/profile")
 async def get_user_profile_legacy(user: dict = Depends(get_current_user)):
@@ -1198,11 +1140,16 @@ async def upload_medical_report(
         from services.llm_service import get_llm_service
         llm = get_llm_service()
         
-        # Initialize lists with regex results
+        # Consolidate bio-metrics from history (all previous profiles)
+        existing_biometrics = MedicalProfileRepository.get_consolidated_biometrics(user_id)
+        
+        # Initialize lists with regex results, merging with existing biometrics
         final_conditions = result.get('conditions', [])
         final_allergens = result.get('allergens', [])
         final_vitals = result.get('vitals', {})
-        final_biometrics = result.get('biometrics', {})
+        final_biometrics = existing_biometrics.copy()
+        # Regex result overrides existing if present
+        final_biometrics.update(result.get('biometrics', {}))
         final_medications = result.get('medications', [])
         
         if llm.is_available and result.get('raw_text'):
@@ -1216,9 +1163,22 @@ async def upload_medical_report(
                     
                     # Clean JSON parsing
                     content = llm_response.content.strip()
-                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                    if json_match:
-                        content = json_match.group(0)
+                    
+                    # 1. Try to extract from Markdown code blocks first
+                    code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+                    if code_block_match:
+                        content = code_block_match.group(1)
+                    else:
+                        # 2. Fallback to finding first outer brace pair
+                        # Non-greedy match to avoid capturing extra text at end
+                        json_match = re.search(r'(\{.*\})', content, re.DOTALL)
+                        if json_match:
+                            content = json_match.group(1)
+                    
+                    # 3. Cleanup common LLM JSON errors
+                    # Fix trailing commas: ,} -> } and ,] -> ]
+                    content = re.sub(r',\s*\}', '}', content)
+                    content = re.sub(r',\s*\]', ']', content)
                     
                     ai_data = json.loads(content)
                     print(f"[MEDICAL REPORT] AI Data: {ai_data}")
@@ -1390,6 +1350,13 @@ async def get_medical_profile(user: dict = Depends(get_current_user)):
     try:
         # Wire up dynamic calculations
         profile_obj = UserProfile.from_dict(raw_profile)
+        
+        # Consolidate biometrics across history for dashboard visibility and TDEE calc
+        consolidated = MedicalProfileRepository.get_consolidated_biometrics(user["sub"])
+        for field, val in consolidated.items():
+            if val is not None and getattr(profile_obj, field, None) in [None, "--", 0, ""]:
+                setattr(profile_obj, field, val)
+                
         tdee = profile_obj.calculate_tdee()
         
         if tdee and tdee > 1000: # Sanity check
@@ -1432,22 +1399,33 @@ async def get_medical_profile(user: dict = Depends(get_current_user)):
         response['daily_targets'] = asdict(profile_obj.daily_targets) if hasattr(profile_obj.daily_targets, '__dataclass_fields__') else profile_obj.daily_targets.__dict__
         
         # Calculate BMI
-        bmi = None
-        if profile_obj.weight_kg and profile_obj.height_cm:
+        bmi = "--"
+        if profile_obj.weight_kg and profile_obj.height_cm and profile_obj.height_cm > 0:
             h = profile_obj.height_cm / 100
             bmi = round(profile_obj.weight_kg / (h * h), 1)
 
-        # Ensure bio_metrics block exists for frontend (crucial for dashboard.html)
+        # Ensure bio_metrics block exists for frontend (standardized response)
         response['bio_metrics'] = {
-            "age": profile_obj.age,
-            "weight_kg": profile_obj.weight_kg,
-            "height_cm": profile_obj.height_cm,
-            "bmi": bmi,
+            "age": profile_obj.age if profile_obj.age not in [None, "", 0] else "--",
+            "weight_kg": profile_obj.weight_kg if profile_obj.weight_kg not in [None, "", 0] else "--",
+            "height_cm": profile_obj.height_cm if profile_obj.height_cm not in [None, "", 0] else "--",
+            "bmi": bmi if bmi not in [None, "", 0] else "--",
             "activity_level": profile_obj.activity_level.value if hasattr(profile_obj.activity_level, 'value') else str(profile_obj.activity_level),
-            "fitness_goal": profile_obj.fitness_goal,
-            "gender": profile_obj.gender or "male"
+            "fitness_goal": profile_obj.fitness_goal or "--",
+            "gender": profile_obj.gender or "--"
         }
         
+        # KEY FIX: Dashboard expects 'allergies' but model has 'allergens'
+        response['allergies'] = response.get('allergens', [])
+        response['conditions'] = response.get('conditions', [])
+
+        # Reconstruct vitals from daily_targets
+        raw_targets = raw_profile.get("daily_targets", {})
+        response['vitals'] = {
+            "glucose_level": raw_targets.get("glucose_level") or raw_targets.get("sugar_level") or "--",
+            "cholesterol": raw_targets.get("cholesterol") or "--",
+        }
+
         return response
 
     except Exception as e:
@@ -1455,10 +1433,11 @@ async def get_medical_profile(user: dict = Depends(get_current_user)):
         # Build minimal bio_metrics even on error if possible
         if raw_profile:
             raw_profile['bio_metrics'] = {
-                "age": raw_profile.get('age'),
-                "weight_kg": raw_profile.get('weight_kg'),
-                "height_cm": raw_profile.get('height_cm'),
-                "gender": raw_profile.get('gender', 'male')
+                "age": raw_profile.get('age') or "--",
+                "weight_kg": raw_profile.get('weight_kg') or "--",
+                "height_cm": raw_profile.get('height_cm') or "--",
+                "bmi": "--",
+                "gender": raw_profile.get('gender', '--')
             }
         return raw_profile
 
@@ -1800,6 +1779,7 @@ async def upload_food_image(
                 }
                 
                 # Save to user session (Persistent DB)
+                # Note: MealRepository.create() already updates daily_logs internally
                 MealRepository.create(
                     user_id=user_id,
                     food_name=meal_data["food_name"],

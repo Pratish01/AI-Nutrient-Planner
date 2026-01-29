@@ -1595,9 +1595,9 @@
                 this.size = Math.random() * 2 + 1;
                 this.sx = (Math.random() - 0.5) * 0.2; this.sy = (Math.random() - 0.5) * 0.2;
                 this.c = colors[Math.floor(Math.random() * colors.length)];
-                this.d = Math.random() * 30 + 1;
+                this.dist = Math.random() * 30 + 1;
             }
-            u() {
+            update() {
                 if (mouse.x) {
                     const dx = mouse.x - this.x, dy = mouse.y - this.y;
                     const d = Math.sqrt(dx * dx + dy * dy);
@@ -1609,14 +1609,20 @@
                 this.x += this.sx; this.y += this.sy;
                 this.x += (this.bx - this.x) * 0.008; this.y += (this.by - this.y) * 0.008;
             }
-            d() { ctx.beginPath(); ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2); ctx.fillStyle = this.c; ctx.fill(); }
+            draw() { ctx.beginPath(); ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2); ctx.fillStyle = this.c; ctx.fill(); }
         }
         const ps = []; for (let i = 0; i < 50; i++) ps.push(new P());
         function anim() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ps.forEach(p => { p.u(); p.d(); });
-            requestAnimationFrame(anim);
+            try {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ps.forEach(p => { p.update(); p.draw(); });
+                requestAnimationFrame(anim);
+            } catch (e) {
+                console.error("Animation error:", e);
+            }
         }
+        // Move init inside DOMContentLoaded to ensure safety, but keep anim separate if needed.
+        // Better to just start it safely.
         anim();
 
         document.addEventListener('DOMContentLoaded', () => {

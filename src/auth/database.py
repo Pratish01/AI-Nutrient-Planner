@@ -122,6 +122,21 @@ def init_database():
             except sqlite3.OperationalError:
                 # Column likely already exists
                 pass
+        
+        # Migrate daily_logs table to add nutrition columns
+        daily_logs_columns = [
+            ("sugar_g", "REAL DEFAULT 0"),
+            ("fiber_g", "REAL DEFAULT 0"),
+            ("sodium_mg", "REAL DEFAULT 0")
+        ]
+        
+        for col_name, col_spec in daily_logs_columns:
+            try:
+                cursor.execute(f"ALTER TABLE daily_logs ADD COLUMN {col_name} {col_spec}")
+                print(f"[DB] Added column {col_name} to daily_logs")
+            except sqlite3.OperationalError:
+                # Column likely already exists
+                pass
 
         conn.commit()
 
@@ -246,6 +261,36 @@ class MedicalProfileRepository:
                 profile['daily_targets'] = json.loads(profile['daily_targets'] or '{}')
                 return profile
             return None
+
+    @staticmethod
+    def get_consolidated_biometrics(user_id: str) -> Dict[str, Any]:
+        """
+        Consolidate bio-metrics across all profiles for a user.
+        Takes the latest non-null value for each biometric field.
+        """
+        biometric_fields = ['age', 'gender', 'weight_kg', 'height_cm', 'activity_level', 'fitness_goal']
+        consolidated = {field: None for field in biometric_fields}
+        
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            # Order by created_at DESC so we encounter newest values first
+            cursor.execute("""
+                SELECT age, gender, weight_kg, height_cm, activity_level, fitness_goal
+                FROM medical_profiles
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+            """, (user_id,))
+            
+            rows = cursor.fetchall()
+            for row in rows:
+                for field in biometric_fields:
+                    if consolidated[field] is None:
+                        val = row[field]
+                        # Check for meaningful value
+                        if val is not None and str(val).strip() != "" and str(val).strip() != "--":
+                            consolidated[field] = val
+                            
+        return consolidated
     
     @staticmethod
     def update(

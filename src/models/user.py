@@ -18,6 +18,7 @@ class HealthCondition(Enum):
     DIABETES = "diabetes"
     HYPERTENSION = "hypertension"
     OBESITY = "obesity"
+    HIGH_CHOLESTEROL = "high_cholesterol"
     # Future conditions can be added here
     # KIDNEY_DISEASE = "kidney_disease"
     # HEART_DISEASE = "heart_disease"
@@ -227,11 +228,24 @@ class UserProfile:
     def from_dict(cls, data: dict) -> "UserProfile":
         """Create UserProfile from dictionary."""
         conditions = []
+        # Fuzzy matching for conditions
         for c in data.get("conditions", []):
+            c_str = str(c).lower().strip()
             try:
-                conditions.append(HealthCondition(c))
+                # 1. Try exact match
+                conditions.append(HealthCondition(c_str))
             except ValueError:
-                print(f"[UserProfile] WARNING: Unknown condition encountered: '{c}'. Ignoring.")
+                # 2. Try mapping common variations
+                if "diabetes" in c_str:
+                    conditions.append(HealthCondition.DIABETES)
+                elif "cholesterol" in c_str:
+                    conditions.append(HealthCondition.HIGH_CHOLESTEROL)
+                elif "blood pressure" in c_str or "hypertension" in c_str:
+                    conditions.append(HealthCondition.HYPERTENSION)
+                elif "weight" in c_str or "obesity" in c_str or "fat" in c_str:
+                    conditions.append(HealthCondition.OBESITY)
+                else:
+                    print(f"[UserProfile] WARNING: Unknown condition encountered: '{c}'. Ignoring.")
 
         # Set appropriate daily targets based on conditions
         if HealthCondition.DIABETES in conditions:
@@ -244,22 +258,31 @@ class UserProfile:
             targets = DailyTargets()
         
         # Handle activity level enum safely
-        activity_str = data.get("activity_level", "moderately_active")
+        activity_str = data.get("activity_level") or "moderately_active"
         try:
             activity = ActivityLevel(activity_str)
         except ValueError:
             activity = ActivityLevel.MODERATELY_ACTIVE
             
+        # Robust numeric conversions
+        def safe_int(val):
+            try: return int(float(val)) if val is not None and str(val).strip() != "" else None
+            except: return None
+            
+        def safe_float(val):
+            try: return float(val) if val is not None and str(val).strip() != "" else None
+            except: return None
+
         return cls(
             user_id=data["user_id"],
             name=data["name"],
             conditions=conditions,
             allergens=data.get("allergens", []),
             daily_targets=targets,
-            age=int(data["age"]) if data.get("age") is not None else None,
+            age=safe_int(data.get("age")),
             gender=data.get("gender"),
-            weight_kg=float(data["weight_kg"]) if data.get("weight_kg") is not None else None,
-            height_cm=float(data["height_cm"]) if data.get("height_cm") is not None else None,
+            weight_kg=safe_float(data.get("weight_kg")),
+            height_cm=safe_float(data.get("height_cm")),
             activity_level=activity,
-            fitness_goal=data.get("fitness_goal"),
+            fitness_goal=data.get("fitness_goal") or "--",
         )

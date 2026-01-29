@@ -543,10 +543,10 @@ def parse_medical_report(file_path: str) -> dict:
             except:
                 pass
 
-    match_weight = re.search(r'weight[^0-9]*(\d{2,3})', text_lower)
+    match_weight = re.search(r'(?:weight|wt|body weight)[^0-9]*(\d{2,3}\.?\d*)', text_lower)
     if match_weight: biometrics["weight_kg"] = float(match_weight.group(1))
     
-    match_height = re.search(r'height[^0-9]*(\d{2,3})', text_lower)
+    match_height = re.search(r'(?:height|ht)[^0-9]*(\d{2,3}\.?\d*)', text_lower)
     if match_height: biometrics["height_cm"] = float(match_height.group(1))
     
     if "female" in text_lower: biometrics["gender"] = "female"

@@ -1,63 +1,75 @@
-import sys
-import os
-from datetime import datetime, timedelta
+import requests
+import json
+import time
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.getcwd(), "src"))
+BASE_URL = "http://localhost:8081"
+EMAIL = f"test_{int(time.time())}@example.com"
+PASSWORD = "password123"
 
-from auth.database import init_database, DailyLogRepository, MealRepository, MedicalProfileRepository
+def test_bmi_persistence():
+    print("--- Starting BMI Persistence Test ---")
+    
+    # 1. Register
+    reg_resp = requests.post(f"{BASE_URL}/auth/register", json={
+        "email": EMAIL, "password": PASSWORD, "name": "Test User"
+    })
+    token = reg_resp.json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    print(f"User registered. Token: {token[:10]}...")
 
-def verify_analytics():
-    print("Initializing Database...")
-    init_database()
-    
-    user_id = "test-user-" + datetime.now().strftime("%H%M%S")
-    print(f"User ID: {user_id}")
-    
-    # 1. Create a dummy medical profile
-    print("Creating medical profile...")
-    MedicalProfileRepository.create(
-        profile_id="prof-1",
-        user_id=user_id,
-        conditions=["diabetes"],
-        allergens=[],
-        daily_targets={"calories": 2000, "protein_g": 100, "carbs_g": 200, "fat_g": 60}
-    )
-    
-    # 2. Log some meals
-    print("Logging meals...")
-    MealRepository.create(user_id, "Apple", {"calories": 95, "protein_g": 0.5, "carbs_g": 25, "fat_g": 0.3})
-    MealRepository.create(user_id, "Chicken Salad", {"calories": 350, "protein_g": 30, "carbs_g": 10, "fat_g": 20})
-    
-    # 3. Fetch today's stats
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    stats = DailyLogRepository.get_or_create(user_id, today_str)
-    print(f"Today's Stats: {stats}")
-    
-    # Verify values
-    if stats['calories_consumed'] == 445:
-        print("✅ Calorie aggregation successful")
-    else:
-        print(f"❌ Calorie aggregation failed: expected 445, got {stats['calories_consumed']}")
+    # 2. Complete Profile (Set weight/height)
+    setup_resp = requests.post(f"{BASE_URL}/api/user/complete-profile", headers=headers, json={
+        "age": 30,
+        "gender": "male",
+        "weight_kg": 80.0,
+        "height_cm": 180.0,
+        "activity_level": "moderately_active",
+        "fitness_goal": "maintenance"
+    })
+    print(f"Profile setup: {setup_resp.status_code}")
+
+    # 3. Check Initial Profile & BMI
+    prof_resp = requests.get(f"{BASE_URL}/api/profile", headers=headers)
+    prof_data = prof_resp.json()
+    initial_bmi = prof_data.get("bio_metrics", {}).get("bmi")
+    print(f"Initial BMI: {initial_bmi}")
+    assert initial_bmi == 24.7
+
+    # 4. Mock a Medical Report Upload (Missing biometrics)
+    # We'll use a small text file as a mock report
+    try:
+        with open("mock_report.txt", "w") as f:
+            f.write("Patient has Diabetes. Blood pressure is 130/85. Cholesterol 210.")
         
-    # 4. Verify Analytics Summary Logic (Portion of main.py logic)
-    print("Verifying summary logic...")
-    weekly_logs = []
-    end_date = datetime.now()
-    for i in range(7):
-        date_str = (end_date - timedelta(days=i)).strftime("%Y-%m-%d")
-        log = DailyLogRepository.get_or_create(user_id, date_str)
-        weekly_logs.append(log)
+        with open("mock_report.txt", "rb") as f:
+            upload_resp = requests.post(
+                f"{BASE_URL}/api/medical-report/upload",
+                headers=headers,
+                files={"file": ("report.txt", f, "text/plain")}
+            )
+        print(f"Report uploaded: {upload_resp.status_code}")
+    finally:
+        import os
+        if os.path.exists("mock_report.txt"):
+            os.remove("mock_report.txt")
+
+    # 5. Check Profile & BMI again
+    prof_resp = requests.get(f"{BASE_URL}/api/profile", headers=headers)
+    prof_data = prof_resp.json()
+    final_bmi = prof_data.get("bio_metrics", {}).get("bmi")
+    final_weight = prof_data.get("bio_metrics", {}).get("weight_kg")
     
-    total_actual_cals = sum(l.get("calories_consumed", 0) for l in weekly_logs)
-    total_target_cals = sum(l.get("calories_target", 2000) for l in weekly_logs)
+    print(f"Final BMI: {final_bmi}")
+    print(f"Final Weight: {final_weight}")
     
-    print(f"Weekly Actual: {total_actual_cals}, Weekly Target: {total_target_cals}")
-    
-    if total_actual_cals == 445:
-        print("✅ Weekly aggregation successful")
-    else:
-        print("❌ Weekly aggregation failed")
+    assert final_weight == 80.0
+    assert final_bmi == 24.7
+    print("--- SUCCESS: BMI Persisted and Correctly Calculated ---")
 
 if __name__ == "__main__":
-    verify_analytics()
+    try:
+        test_bmi_persistence()
+    except Exception as e:
+        print(f"FAILED: {e}")
+        import traceback
+        traceback.print_exc()
