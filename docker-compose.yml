@@ -1,38 +1,50 @@
-version: '3.8'
-
 services:
+  # ─── Ollama LLM Server ───────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai-nutrition-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    # Uncomment below for NVIDIA GPU support:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    restart: unless-stopped
+
+  # ─── AI Nutrition App ────────────────────────────────────────
   app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: ai-nutrition
+    container_name: ai-nutrition-app
     ports:
-      - "${PORT:-8000}:8000"
+      - "8081:8081"
+    env_file:
+      - .env
     environment:
-      - ENVIRONMENT=${ENVIRONMENT:-development}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - PORT=8000
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - PORT=8081
+      - ENVIRONMENT=${ENVIRONMENT:-production}
     volumes:
-      # Persist logs
       - ./logs:/app/logs
-      # Development: hot reload (comment out for production)
+      # Uncomment for development hot-reload:
       # - ./src:/app/src
       # - ./static:/app/static
+    depends_on:
+      - ollama
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 30s
     restart: unless-stopped
 
-  # Optional: Log aggregation (uncomment if needed)
-  # logs:
-  #   image: datalust/seq:latest
-  #   ports:
-  #     - "5341:80"
-  #   volumes:
-  #     - seq-data:/data
-
-# volumes:
-#   seq-data:
+volumes:
+  ollama-data:

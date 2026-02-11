@@ -1,28 +1,36 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-*.pyo
-
 # Virtual environments
 venv/
 env/
 .venv/
 ENV/
 
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
 # IDE
 .vscode/
 .idea/
+.gemini/
 *.swp
 *.swo
+
+# Git
+.git/
+.github/
+.gitignore
 
 # Testing
 .pytest_cache/
 .coverage
 htmlcov/
 .tox/
+tests/
+pytest.ini
 
-# Logs (keep structure, ignore content)
+# Logs
 logs/*.jsonl
 logs/*.log
 *.log
@@ -40,11 +48,39 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
-
-# Docker
 *.tar
 
-# Temporary files
+# Temporary / debug files
 tmp/
 temp/
 *.tmp
+debug_*.py
+verify_*.py
+test_*.py
+fix_*.py
+reproduce_*.py
+inspect_*.py
+diagnose_*.py
+audit_*.py
+check_*.py
+seed_*.py
+read_*.py
+overwrite_*.py
+repair_*.py
+update_main.py
+final_fix.py
+distribute_dishes.py
+quick_*.py
+setup_test_images.py
+task_ui_endpoints.py
+diag_*.py
+
+# Documentation (not needed in container)
+*.pdf
+*.html
+docs/
+Full_Project_Explanation.md
+rebuild_*.txt
+
+# Batch scripts
+*.bat
